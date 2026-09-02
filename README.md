@@ -18,27 +18,29 @@ to the Omnigent HTTP API (Bearer JWT) and the Slack Web API (bot token).
 ```
    Omnigent server                         Slack
         │                                    │
-        │  GET /v1/sessions (poll)           │  per-session channel
-        │  GET /v1/sessions/{id}/items       │  #ck-<agent>
-        │  ──────────────────────────────▶   │  (#ck-<agent>-<shortid> on conflict)
+        │  WS /v1/sessions/updates (stream)  │  per-session channel
+        │  GET /v1/sessions/{id}/items       │  #ck-<project>-<title>
+        │  ──────────────────────────────▶   │  (renamed live as title changes)
         │     (blocked alert / mirrored      │
         │      assistant reply)              │
         │                                    │  you reply (top-level)
-        │  POST /v1/sessions/{id}/events     │  ◀── conversations.history poll
+        │  POST /v1/sessions/{id}/events     │  ◀── Socket Mode (real-time push)
         │  ◀──────────────────────────────   │
         │     (forwarded as a user message)  │
 ```
 
-Channel names: `#<prefix>-<agent_name>` e.g. `#ck-pi-native-ui`. If that name
-is already taken (another session runs the same agent), the bridge appends the
-session shortid — `#ck-pi-native-ui-b8f1a7` — so each session still gets its
-own channel. Routing is by channel id stored in local state (keyed by session id).
+Channel names: `#<prefix>-<project>-<title-slug>` e.g.
+`#ck-git-parity-rejection-reply`. The channel name tracks the session title
+live (renamed when the title changes), so the channel stays recognizable as
+Omnigent auto-renames the session. If the name is already taken by another
+session, the session shortid is appended. Routing is by channel id stored in
+local state (keyed by session id).
 
 ## Why this is easier than the Herdr version
 
 | Herdr bridge | Omnigent bridge |
 |---|---|
-| One-shot plugin event hooks + a separate poller daemon, juggling `HERDR_SESSION`/`HERDR_SOCKET_PATH` | **One daemon.** Polls `GET /v1/sessions`; sends replies via `POST /v1/sessions/{id}/events`. |
+| One-shot plugin event hooks + a separate poller daemon, juggling `HERDR_SESSION`/`HERDR_SOCKET_PATH` | **One daemon, fully event-driven.** Streams session updates via `WS /v1/sessions/updates`; receives Slack replies via Socket Mode. |
 | Read pi's JSONL transcript file directly — agent-specific, only pi worked | `GET /v1/sessions/{id}/items` — structured, **harness-agnostic** (pi, claude, codex, …) |
 | `herdr pane run` = typing into a tmux pane | A proper user-message event — no tty contention |
 | Routing by opaque pane-id | Sessions carry `agent_name`, `title`, `workspace` directly |
@@ -59,22 +61,24 @@ Omnigent session `status` is `idle` / `running` / `waiting` / `failed`.
   `~/.omnigent/auth_tokens.json`. The token is an ~8h JWT; the bridge re-reads
   it on 401, but it relies on your normal `omnigent` CLI use (or a periodic
   `omnigent login`) to keep it fresh.
-- Python 3.10+ (stdlib only — nothing to `pip install`; `pyyaml` is used if
-  available to parse `config.yaml`, with a regex fallback).
-- A Slack workspace where you can create an app.
+- Python 3.10+ with `slack_sdk` and `websockets` installed (`pip install
+  slack_sdk websockets`). Both are pure-Python and lightweight.
+- A Slack app with **Socket Mode** and **Event Subscriptions** enabled — see
+  **[SETUP.md](SETUP.md)** for the full, copy-pasteable guide (manifest, scopes,
+  tokens, event subscriptions, troubleshooting).
 
 ## Setup
 
 ### 1. Create the Slack app
 
+See **[SETUP.md](SETUP.md)** for the full guide (manifest, Socket Mode, event
+subscriptions, tokens, troubleshooting). Short version:
+
 1. <https://api.slack.com/apps> → **Create New App** → **From an app manifest**.
 2. Paste [`slack-manifest.json`](slack-manifest.json).
-3. **Install App** to your workspace.
-4. **OAuth & Permissions** → copy the **Bot User OAuth Token** (`xoxb-...`).
-5. Find your **Slack user id** (`U...`): Slack → Profile → ⋯ → Copy member ID.
-
-The manifest requests: `chat:write`, `channels:manage`, `channels:history`,
-`channels:read`, `invites:write` (plus `groups:*` for private channels).
+3. **Install App** → copy the **Bot User OAuth Token** (`xoxb-...`) and the
+   **App-Level Token** (`xapp-...`, from Socket Mode).
+4. Find your **Slack user id** (`U...`).
 
 ### 2. Write config
 
@@ -145,8 +149,9 @@ auto-renames the session.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `SLACK_BOT_TOKEN` | — | Bot OAuth token (`xoxb-...`). Required. |
-| `OMNIGENT_SLACK_BRIDGE_PREFIX` | `ck` | Channel-name prefix. Required. |
+| `SLACK_BOT_TOKEN` | — | Bot OAuth token (`xoxb-...`). **Required.** |
+| `SLACK_APP_TOKEN` | — | App-Level token for Socket Mode (`xapp-...`). **Required** for real-time inbound. |
+| `OMNIGENT_SLACK_BRIDGE_PREFIX` | `ck` | Channel-name prefix. **Required.** |
 | `SLACK_USER_ID` | — | Your Slack user id; `@mentioned` once on the first blocked. |
 | `OMNIGENT_SERVER_URL` | from `~/.omnigent/config.yaml` | Omnigent server. |
 | `OMNIGENT_AUTH_TOKEN` | from `~/.omnigent/auth_tokens.json` | Bearer JWT. |

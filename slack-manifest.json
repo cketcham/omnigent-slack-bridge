@@ -25,6 +25,13 @@
     }
   },
   "settings": {
-    "org_app_enabled": false
+    "org_app_enabled": false,
+    "event_subscriptions": {
+      "bot_events": [
+        "message.channels",
+        "message.groups",
+        "message.im"
+      ]
+    }
   }
 }

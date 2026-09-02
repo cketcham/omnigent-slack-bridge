@@ -823,6 +823,7 @@ class Bridge:
         client.web_client = WebClient(token=self.cfg.slack_bot_token)
 
         def handler(cli, req: SocketModeRequest) -> None:
+            log(f"inbound: socket event type={req.type} payload_type={req.payload.get('event',{}).get('type','')}")
             if req.type == "events_api":
                 event = req.payload.get("event", {})
                 if event.get("type") == "message" and not event.get("bot_id") and not event.get("subtype"):

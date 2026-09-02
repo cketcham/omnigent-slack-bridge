@@ -18,21 +18,21 @@ to the Omnigent HTTP API (Bearer JWT) and the Slack Web API (bot token).
 ```
    Omnigent server                         Slack
         │                                    │
-        │  GET /v1/sessions (poll)           │
-        │  GET /v1/sessions/{id}/items       │
-        │  ──────────────────────────────▶   │  per-session channel
-        │     (blocked alert / mirrored      │  #ck-<agent>-<shortid>
+        │  GET /v1/sessions (poll)           │  per-session channel
+        │  GET /v1/sessions/{id}/items       │  #ck-<agent>
+        │  ──────────────────────────────▶   │  (#ck-<agent>-<shortid> on conflict)
+        │     (blocked alert / mirrored      │
         │      assistant reply)              │
-        │                                    │
-        │  POST /v1/sessions/{id}/events     │  you reply (top-level)
-        │  ◀──────────────────────────────   │  conversations.history poll
+        │                                    │  you reply (top-level)
+        │  POST /v1/sessions/{id}/events     │  ◀── conversations.history poll
+        │  ◀──────────────────────────────   │
         │     (forwarded as a user message)  │
 ```
 
-Channel names: `#<prefix>-<agent_name>-<shortid>`, e.g. `#ck-pi-native-ui-b8f1a7`.
-The `<shortid>` is the last 6 chars of the session id, so multiple sessions of
-the same agent never collide. Routing is by channel id stored in local state
-(keyed by session id).
+Channel names: `#<prefix>-<agent_name>` e.g. `#ck-pi-native-ui`. If that name
+is already taken (another session runs the same agent), the bridge appends the
+session shortid — `#ck-pi-native-ui-b8f1a7` — so each session still gets its
+own channel. Routing is by channel id stored in local state (keyed by session id).
 
 ## Why this is easier than the Herdr version
 

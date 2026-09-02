@@ -367,17 +367,6 @@ class SlackClient:
                 break
         return ""
 
-    def create_unique(self, base: str, private: bool) -> tuple[str, str]:
-        name = base
-        for suffix in range(2, 21):
-            try:
-                return self.create_channel(name, private), name
-            except ApiError as e:
-                if e.err != "name_taken":
-                    raise
-                name = f"{base}-{suffix}"
-        raise ApiError("slack.create", f"could not create unique channel for {base}")
-
 
 # ──────────────────────────────────────────────────────────────────────────
 # Channel naming
@@ -386,9 +375,10 @@ class SlackClient:
 _SAFE = re.compile(r"[^a-z0-9_-]+")
 
 
-def channel_name(prefix: str, agent: str, session_id: str) -> str:
-    short = (session_id or "")[-6:]
-    parts = [prefix, agent, short]
+def channel_name(prefix: str, agent: str) -> str:
+    """Preferred channel name: #<prefix>-<agent>. The shortid is appended
+    only on a name conflict (see conflict_name), so the common case is short."""
+    parts = [prefix, agent]
     cleaned = [_safe_part(p) for p in parts]
     name = "-".join(p for p in cleaned if p)
     name = _SAFE.sub("-", name)
@@ -396,6 +386,12 @@ def channel_name(prefix: str, agent: str, session_id: str) -> str:
     if len(name) > 80:
         name = name[:80].rstrip("-_")
     return name or "omnigent-agent"
+
+
+def conflict_name(prefix: str, agent: str, session_id: str) -> str:
+    """Fallback when #<prefix>-<agent> is taken: append the session shortid."""
+    short = (session_id or "")[-6:]
+    return channel_name(f"{prefix}-{agent}-{short}", "")
 
 
 def _safe_part(s: str) -> str:
@@ -539,9 +535,11 @@ class Bridge:
             return
 
         # Agent rename → archive old channel, force a fresh one next.
-        want_name = channel_name(self.cfg.prefix, agent, sid)
-        if rec.channel_id and rec.channel_name and rec.channel_name != want_name:
-            log(f"agent renamed: {rec.channel_name} -> {want_name}; migrating")
+        # Detect by comparing agent names (not channel names): a suffixed
+        # conflict channel (e.g. #ck-pi-b8f1a7) must NOT look like a rename.
+        want_name = channel_name(self.cfg.prefix, agent)
+        if rec.channel_id and rec.agent_name and rec.agent_name != agent:
+            log(f"agent renamed: {rec.agent_name} -> {agent}; migrating")
             if not rec.closed:
                 self.slack.post_message(rec.channel_id, f"📦 Agent renamed; moving to #{want_name}.")
                 self.slack.archive(rec.channel_id)
@@ -566,9 +564,9 @@ class Bridge:
 
         # Lazily create the channel on the first actionable event.
         if not rec.channel_id:
-            cid = self._create_channel(want_name)
+            cid, cname = self._create_channel(want_name, agent, sid)
             sessions[sid]["channel_id"] = cid
-            sessions[sid]["channel_name"] = want_name
+            sessions[sid]["channel_name"] = cname
             self.slack.invite_user(cid, self.cfg.slack_user_id)
             intro = f"🚀 Channel for agent *{agent}* (`{sid[:8]}`)."
             if title:
@@ -610,16 +608,21 @@ class Bridge:
                 sessions[sid]["last_mirror_id"] = new_last_id or rec.last_mirror_id
         sessions[sid]["last_status"] = status
 
-    def _create_channel(self, name: str) -> str:
+    def _create_channel(self, name: str, agent: str, sid: str) -> tuple[str, str]:
+        """Create the channel, falling back to a shortid-suffixed name on a
+        conflict. Returns (channel_id, actual_name_used)."""
         try:
-            return self.slack.create_channel(name, self.cfg.private)
+            return self.slack.create_channel(name, self.cfg.private), name
         except ApiError as e:
             if e.err == "name_taken":
                 cid = self.slack.lookup_by_name(name, self.cfg.private)
                 if cid:
                     self.slack.unarchive(cid)
-                    return cid
-                return self.slack.create_unique(name, self.cfg.private)[0]
+                    return cid, name
+                # Name taken by another session's channel: fall back to the
+                # shortid-suffixed name so this session still gets its own.
+                fb = conflict_name(self.cfg.prefix, agent, sid)
+                return self.slack.create_channel(fb, self.cfg.private), fb
             raise
 
     def _alert_text(self, agent, title, sid, status, mention) -> str:

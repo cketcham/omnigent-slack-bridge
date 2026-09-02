@@ -281,11 +281,9 @@ class OmnigentClient:
         return False
 
     def _refresh_via_server(self) -> bool:
-        """Get a fresh access token. Two strategies:
-        1. If a refresh_token is stored, POST /oauth/token (no credentials needed).
-        2. Otherwise, re-login via /auth/login using ~/.omnigent/login-credentials.
-        On success, persist the new token and return True.
-        """
+        """Try to get a fresh token. The token-keeper daemon is the primary
+        mechanism; this is a fallback for when the keeper isn't running.
+        Tries refresh_token exchange, then re-login with stored credentials."""
         # Strategy 1: refresh token exchange.
         entry = _load_token_entry(self.cfg.server_url) or {}
         rt = entry.get("refresh_token") if entry else ""
@@ -308,8 +306,7 @@ class OmnigentClient:
             self._token = new_token
             _store_token(self.cfg.server_url, new_token, new_refresh, entry)
             return True
-
-        # Strategy 2: re-login with stored credentials.
+        # Strategy 2: re-login with stored credentials (fallback if keeper isn't running).
         creds = _load_login_credentials()
         if not creds:
             return False
@@ -971,9 +968,6 @@ class Bridge:
         watched = [s["id"] for s in sessions]
         log(f"outbound: watching {len(watched)} sessions via websocket")
 
-        # Start a background task to proactively refresh the token.
-        asyncio.create_task(self._token_refresh_loop())
-
         headers = {"Authorization": f"Bearer {self.omni.token}"}
         async with websockets.connect(self._ws_url(), additional_headers=headers) as ws:
             await ws.send(json.dumps({"type": "watch", "session_ids": watched}))
@@ -1001,22 +995,6 @@ class Bridge:
                         await ws.send(json.dumps({"type": "watch", "session_ids": watched}))
                         log(f"outbound: discovered {len(new_ids)} new session(s); now watching {len(watched)}")
                 # heartbeat / removed frames need no action.
-
-    async def _token_refresh_loop(self) -> None:
-        """Proactively refresh the auth token before it expires.
-        Checks every 5 minutes; re-logins when <1h of lifetime remains."""
-        while True:
-            await asyncio.sleep(300)  # check every 5 min
-            entry = _load_token_entry(self.cfg.server_url) or {}
-            expires_at = entry.get("expires_at", 0)
-            if not isinstance(expires_at, (int, float)):
-                continue
-            remaining = expires_at - time.time()
-            if remaining < 3600:  # <1h left
-                log(f"auth: token expires in {remaining/60:.0f}m; refreshing...")
-                ok = await asyncio.to_thread(self.omni._refresh_via_server)
-                if not ok:
-                    log("auth: proactive refresh failed; will retry in 5m")
 
     def run(self) -> None:
         mode = "socket-mode" if self.cfg.slack_app_token else "polling"

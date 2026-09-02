@@ -20,6 +20,7 @@ Slack Web API (bot token). No plugin hooks, no socket paths, no tmux.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import re
@@ -109,13 +110,14 @@ def _store_token(server_url: str, token: str, refresh_token: str, prev: dict[str
 @dataclass
 class Config:
     slack_bot_token: str = ""
+    slack_app_token: str = ""  # xapp-... for Socket Mode (real-time inbound)
     slack_user_id: str = ""
     prefix: str = DEFAULT_PREFIX
     private: bool = False
     server_url: str = ""
     auth_token: str = ""
     poll_interval: int = DEFAULT_POLL_INTERVAL
-    inbound_interval: int = 30  # seconds between inbound history polls
+    inbound_interval: int = 60  # seconds between inbound history polls
     allowed_users: list[str] = field(default_factory=list)
     state_dir: str = _default_state_dir()
     project: str = ""  # optional Omnigent project filter
@@ -168,6 +170,7 @@ def load_config() -> Config:
 
     c = Config(
         slack_bot_token=get("SLACK_BOT_TOKEN"),
+        slack_app_token=get("SLACK_APP_TOKEN"),
         slack_user_id=get("SLACK_USER_ID"),
         prefix=get("OMNIGENT_SLACK_BRIDGE_PREFIX") or DEFAULT_PREFIX,
         private=_bool(get("OMNIGENT_SLACK_BRIDGE_PRIVATE")),
@@ -177,7 +180,7 @@ def load_config() -> Config:
         allowed_users=_list(get("OMNIGENT_SLACK_BRIDGE_ALLOWED_USERS")),
         state_dir=get("OMNIGENT_SLACK_BRIDGE_STATE_DIR") or _default_state_dir(),
         project=get("OMNIGENT_SLACK_BRIDGE_PROJECT"),
-        inbound_interval=_int(get("OMNIGENT_SLACK_BRIDGE_INBOUND_INTERVAL"), 30),
+        inbound_interval=_int(get("OMNIGENT_SLACK_BRIDGE_INBOUND_INTERVAL"), 60),
     )
     return c
 
@@ -224,15 +227,16 @@ class ApiError(Exception):
         self.payload = payload
 
 
-def _http_request(method: str, url: str, headers: dict[str, str], body: bytes | None) -> tuple[int, bytes]:
+def _http_request(method: str, url: str, headers: dict[str, str], body: bytes | None) -> tuple[int, bytes, dict[str, str]]:
     req = urllib.request.Request(url, data=body, method=method)
     for k, v in headers.items():
         req.add_header(k, v)
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
-            return resp.status, resp.read()
+            return resp.status, resp.read(), {k.lower(): v for k, v in resp.headers.items()}
     except urllib.error.HTTPError as e:
-        return e.code, e.read()
+        hdrs = {k.lower(): v for k, v in e.headers.items()} if e.headers else {}
+        return e.code, e.read(), hdrs
     except urllib.error.URLError as e:
         raise ApiError("http", str(e))
 
@@ -298,7 +302,7 @@ class OmnigentClient:
             url += "?" + urllib.parse.urlencode(query)
         data = json.dumps(body).encode() if body is not None else None
         for attempt in range(2):
-            status, raw = _http_request(method, url, self._headers(), data)
+            status, raw, _ = _http_request(method, url, self._headers(), data)
             if status == 401 and attempt == 0 and self._reload_token():
                 continue  # retry once with a refreshed token
             if status == 401:
@@ -366,7 +370,7 @@ class SlackClient:
             headers["Content-Type"] = "application/x-www-form-urlencoded"
         else:
             url += "?" + urllib.parse.urlencode(params)
-        status, raw = _http_request("POST" if post else "GET", url, headers, data)
+        status, raw, resp_headers = _http_request("POST" if post else "GET", url, headers, data)
         try:
             out = json.loads(raw.decode())
         except Exception:
@@ -376,8 +380,15 @@ class SlackClient:
             # backoff so the next call waits. Slack sends it as a header and
             # also in the JSON body for socket-mode-style calls.
             if out.get("error") == "ratelimited":
-                retry_after = float(out.get("retry_after") or 1)
+                # Slack sends Retry-After as an HTTP header (seconds).
+                # Fall back to the JSON body field (socket-mode) or 30s default.
+                ra = resp_headers.get("retry-after") or out.get("retry_after") or "30"
+                try:
+                    retry_after = float(ra)
+                except (ValueError, TypeError):
+                    retry_after = 30
                 SlackClient._rate_limit_until = time.monotonic() + retry_after
+                log(f"slack {method} ratelimited; backing off {retry_after}s")
             raise ApiError(f"slack.{method}", out.get("error", "unknown"), out)
         return out
 
@@ -587,6 +598,7 @@ class Bridge:
         self.slack = SlackClient(cfg.slack_bot_token)
         self.store = StateStore(cfg.state_dir)
         self._projects: dict[str, str] | None = None  # project_id -> name cache
+        self._socket_mode = False
 
     def _project_name(self, s: dict[str, Any]) -> str:
         """Resolve a session's project to a human name, falling back to the
@@ -785,10 +797,72 @@ class Bridge:
                 break
         return "\n\n".join(texts), new_last
 
-    # -- inbound: forward Slack replies into sessions -----------------
+    # -- inbound: Socket Mode (real-time push, no polling) -------------
 
-    def tick_inbound(self) -> None:
-        # Skip the whole inbound pass while a Slack rate-limit backoff is active.
+    def _start_socket_mode(self) -> None:
+        """Start a Slack Socket Mode client that receives message events in
+        real-time via websocket. Replaces conversations.history polling —
+        no rate limit, no polling interval."""
+        try:
+            from slack_sdk.socket_mode.builtin import SocketModeClient
+            from slack_sdk.socket_mode.request import SocketModeRequest
+            from slack_sdk.web import WebClient
+        except ImportError:
+            log("inbound: slack_sdk not installed — falling back to polling")
+            self._socket_mode = False
+            return
+
+        app_token = self.cfg.slack_app_token
+        if not app_token:
+            log("inbound: no SLACK_APP_TOKEN — falling back to polling")
+            self._socket_mode = False
+            return
+
+        self._socket_mode = True
+        client = SocketModeClient(app_token=app_token)
+        client.web_client = WebClient(token=self.cfg.slack_bot_token)
+
+        def handler(cli, req: SocketModeRequest) -> None:
+            if req.type == "events_api":
+                event = req.payload.get("event", {})
+                if event.get("type") == "message" and not event.get("bot_id") and not event.get("subtype"):
+                    self._handle_inbound_message(event)
+            # Acknowledge the request so Slack doesn't retry.
+            cli.send_socket_mode_response(req.to_response())
+
+        client.socket_mode_request_listeners.append(handler)
+        client.connect()
+        log("inbound: socket mode connected (real-time message push)")
+
+    def _handle_inbound_message(self, event: dict[str, Any]) -> None:
+        """Forward a Slack user message to the matching Omnigent session."""
+        channel_id = event.get("channel") or ""
+        user = event.get("user") or ""
+        text = (event.get("text") or "").strip()
+        if not text or not channel_id:
+            return
+        if not self._user_allowed(user):
+            return
+        # Look up the session for this channel.
+        for rec in self.store.records():
+            if rec.channel_id == channel_id and not rec.closed:
+                try:
+                    self.omni.send_message(rec.session_id, text)
+                    log(f"inbound: forwarded to {rec.session_id[:12]} (#{rec.channel_name})")
+                except ApiError as e:
+                    log(f"inbound: forward to {rec.session_id[:12]}: {e}")
+                return
+        log(f"inbound: no session for channel {channel_id}")
+
+    def _user_allowed(self, user: str) -> bool:
+        if not self.cfg.allowed_users:
+            return user != ""
+        return user in self.cfg.allowed_users
+
+    # -- inbound fallback: polling (when socket mode unavailable) ------
+
+    def tick_inbound_polling(self) -> None:
+        """Fallback: poll conversations.history when Socket Mode isn't available."""
         if SlackClient._rate_limit_until > time.monotonic():
             return
         for rec in self.store.records():
@@ -800,7 +874,7 @@ class Bridge:
                 if e.err in ("channel_archived", "channel_not_found", "method_not_supported_for_channel_type"):
                     self._set_field(rec.session_id, "closed", True)
                 elif e.err == "ratelimited":
-                    return  # _call already set the backoff; stop this pass
+                    return
                 else:
                     log(f"inbound: {rec.channel_name}: {e}")
             except Exception as e:
@@ -834,25 +908,68 @@ class Bridge:
         if newest != rec.last_seen_ts:
             self._set_field(rec.session_id, "last_seen_ts", newest)
 
-    def _user_allowed(self, user: str) -> bool:
-        if not self.cfg.allowed_users:
-            return user != ""
-        return user in self.cfg.allowed_users
-
     def _set_field(self, sid: str, key: str, value: Any) -> None:
         self.store.update(lambda sess: sess.setdefault(sid, {}).__setitem__(key, value))
 
     # -- main loop ----------------------------------------------------
 
+    # -- outbound: stream session updates via websocket ---------------
+
+    def _ws_url(self) -> str:
+        return self.cfg.server_url.replace("https://", "wss://").replace("http://", "ws://") + "/v1/sessions/updates"
+
+    async def _run_websocket(self) -> None:
+        """Connect to /v1/sessions/updates and process changed frames in real-time.
+        Replaces the 5s polling loop — zero traffic when idle, instant on change."""
+        import websockets
+
+        # Initial watch-set: all my top-level sessions.
+        sessions = self.omni.list_my_sessions()
+        watched = [s["id"] for s in sessions]
+        log(f"outbound: watching {len(watched)} sessions via websocket")
+
+        headers = {"Authorization": f"Bearer {self.omni.token}"}
+        async with websockets.connect(self._ws_url(), additional_headers=headers) as ws:
+            await ws.send(json.dumps({"type": "watch", "session_ids": watched}))
+
+            while True:
+                try:
+                    raw = await ws.recv()
+                except websockets.ConnectionClosed:
+                    log("outbound: websocket closed; reconnecting...")
+                    await asyncio.sleep(2)
+                    return  # exits this coroutine; run() will reconnect
+
+                frame = json.loads(raw)
+                ftype = frame.get("type")
+
+                if ftype in ("snapshot", "changed"):
+                    items = frame.get("items", [])
+                    # Process each changed session in a thread (sync REST/Slack calls).
+                    for item in items:
+                        await asyncio.to_thread(self._handle_session, item)
+                    # Discover new session ids not in our watch-set; re-watch.
+                    new_ids = [it["id"] for it in items if it.get("id") and it["id"] not in watched]
+                    if new_ids:
+                        watched.extend(new_ids)
+                        await ws.send(json.dumps({"type": "watch", "session_ids": watched}))
+                        log(f"outbound: discovered {len(new_ids)} new session(s); now watching {len(watched)}")
+                # heartbeat / removed frames need no action.
+
     def run(self) -> None:
-        log(f"omnigent-slack-bridge started; server={self.cfg.server_url} prefix={self.cfg.prefix} interval={self.cfg.poll_interval}s inbound={self.cfg.inbound_interval}s")
-        last_inbound = 0.0
+        mode = "socket-mode" if self.cfg.slack_app_token else "polling"
+        log(f"omnigent-slack-bridge started; server={self.cfg.server_url} prefix={self.cfg.prefix} outbound=websocket inbound={mode}")
+        self._start_socket_mode()
+
+        # Run the Omnigent websocket in the main thread (asyncio loop).
+        # Slack Socket Mode runs in its own background thread.
+        import asyncio
         while True:
-            self.tick_outbound()
-            if time.monotonic() - last_inbound >= self.cfg.inbound_interval:
-                self.tick_inbound()
-                last_inbound = time.monotonic()
-            time.sleep(max(1, self.cfg.poll_interval))
+            try:
+                asyncio.run(self._run_websocket())
+            except Exception as e:
+                log(f"outbound: websocket error: {e}; reconnecting in 5s...")
+                time.sleep(5)
 
 
 def _ts_greater(a: str, b: str) -> bool:

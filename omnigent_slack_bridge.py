@@ -865,7 +865,6 @@ class Bridge:
         client.web_client = WebClient(token=self.cfg.slack_bot_token)
 
         def handler(cli, req: SocketModeRequest) -> None:
-            log(f"inbound: socket event type={req.type} payload_type={req.payload.get('event',{}).get('type','')}")
             if req.type == "events_api":
                 event = req.payload.get("event", {})
                 if event.get("type") == "message" and not event.get("bot_id") and not event.get("subtype"):
@@ -882,13 +881,8 @@ class Bridge:
         channel_id = event.get("channel") or ""
         user = event.get("user") or ""
         text = (event.get("text") or "").strip()
-        bot_id = event.get("bot_id") or ""
-        subtype = event.get("subtype") or ""
-        log(f"inbound: msg channel={channel_id} user={user} bot_id={bot_id} sub={subtype} text={text[:50]!r}")
         if not text or not channel_id:
             return
-        if bot_id or subtype:
-            return  # skip bot messages and join/leave subtypes
         if not self._user_allowed(user):
             return
         # Look up the session for this channel.

@@ -8,8 +8,9 @@ channel so you can see the reply from your phone. You reply top-level in the
 channel and the text is forwarded into the session as a user message via
 ``POST /v1/sessions/{id}/events``.
 
-Channel names: ``#<prefix>-<agent_name>-<shortid>`` e.g. ``#ck-pi-native-ui-b8f1a7``.
-Routing is by channel id stored in local state (the session id is the key).
+Channel names: ``#<prefix>-<project>-<title-slug>`` e.g. ``#ck-git-parity-rejection-reply``.
+The channel name tracks the session title live (renamed when the title changes),
+so the channel stays recognizable as Omnigent auto-renames the session.
 
 Pure stdlib (urllib + json) so there is nothing to pip install. Talks to the
 Omnigent HTTP API (Bearer JWT from ``~/.omnigent/auth_tokens.json``) and the
@@ -69,15 +70,40 @@ def _default_server_url() -> str:
 
 def _load_token(server_url: str) -> str:
     """Read the bearer JWT for ``server_url`` from ~/.omnigent/auth_tokens.json."""
+    entry = _load_token_entry(server_url) or {}
+    return entry.get("token") or ""
+
+
+def _load_token_entry(server_url: str) -> dict[str, Any] | None:
     path = Path.home() / ".omnigent" / "auth_tokens.json"
     if not path.exists():
-        return ""
+        return None
     try:
         data = json.loads(path.read_text())
-        entry = data.get(server_url) or {}
-        return entry.get("token") or ""
+        return data.get(server_url) or {}
     except Exception:
-        return ""
+        return None
+
+
+def _store_token(server_url: str, token: str, refresh_token: str, prev: dict[str, Any] | None) -> None:
+    """Persist a refreshed access token (and new refresh token) back to disk."""
+    path = Path.home() / ".omnigent" / "auth_tokens.json"
+    try:
+        data = json.loads(path.read_text()) if path.exists() else {}
+    except Exception:
+        data = {}
+    entry = data.get(server_url) or {}
+    if prev:
+        entry.update(prev)
+    entry["token"] = token
+    if refresh_token:
+        entry["refresh_token"] = refresh_token
+    import time as _t
+    entry["expires_at"] = _t.time() + (8 * 3600)
+    data[server_url] = entry
+    tmp = str(path) + ".tmp"
+    Path(tmp).write_text(json.dumps(data, indent=2))
+    os.replace(tmp, str(path))
 
 
 @dataclass
@@ -89,6 +115,7 @@ class Config:
     server_url: str = ""
     auth_token: str = ""
     poll_interval: int = DEFAULT_POLL_INTERVAL
+    inbound_interval: int = 30  # seconds between inbound history polls
     allowed_users: list[str] = field(default_factory=list)
     state_dir: str = _default_state_dir()
     project: str = ""  # optional Omnigent project filter
@@ -150,6 +177,7 @@ def load_config() -> Config:
         allowed_users=_list(get("OMNIGENT_SLACK_BRIDGE_ALLOWED_USERS")),
         state_dir=get("OMNIGENT_SLACK_BRIDGE_STATE_DIR") or _default_state_dir(),
         project=get("OMNIGENT_SLACK_BRIDGE_PROJECT"),
+        inbound_interval=_int(get("OMNIGENT_SLACK_BRIDGE_INBOUND_INTERVAL"), 30),
     )
     return c
 
@@ -224,12 +252,42 @@ class OmnigentClient:
         return self._token
 
     def _reload_token(self) -> bool:
-        """Re-read the JWT from disk (the CLI may have refreshed it)."""
+        """Get a fresh token: try the server's refresh endpoint first (using
+        the refresh_token stored alongside the JWT), then fall back to
+        re-reading the JWT from disk (the CLI may have refreshed it)."""
+        if self._refresh_via_server():
+            return True
         t = _load_token(self.cfg.server_url)
         if t and t != self._token:
             self._token = t
             return True
         return False
+
+    def _refresh_via_server(self) -> bool:
+        """POST /oauth/token with the stored refresh_token. On success, persist
+        the new access+refresh tokens and return True."""
+        entry = _load_token_entry(self.cfg.server_url)
+        rt = entry.get("refresh_token") if entry else ""
+        if not rt:
+            return False
+        body = urllib.parse.urlencode({"grant_type": "refresh_token", "refresh_token": rt}).encode()
+        url = self.base + "/oauth/token"
+        req = urllib.request.Request(url, data=body, method="POST")
+        req.add_header("Content-Type", "application/x-www-form-urlencoded")
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                if resp.status != 200:
+                    return False
+                out = json.loads(resp.read().decode())
+        except Exception:
+            return False
+        new_token = out.get("access_token") or out.get("token") or ""
+        new_refresh = out.get("refresh_token") or ""
+        if not new_token:
+            return False
+        self._token = new_token
+        _store_token(self.cfg.server_url, new_token, new_refresh, entry)
+        return True
 
     def _headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self._token}", "Content-Type": "application/json"}
@@ -273,6 +331,11 @@ class OmnigentClient:
             "data": {"role": "user", "content": [{"type": "input_text", "text": text}]},
         })
 
+    def list_projects(self) -> dict[str, str]:
+        """Return {project_id: project_name} for the caller's projects."""
+        res = self._call("GET", "/v1/projects")
+        return {p["id"]: p.get("name", "") for p in (res.get("data") or [])}
+
 
 # ──────────────────────────────────────────────────────────────────────────
 # Slack client (Web API, stdlib only)
@@ -282,10 +345,19 @@ SLACK_API = "https://slack.com/api"
 
 
 class SlackClient:
+    # Global rate-limit backoff: when Slack returns `ratelimited`, all calls
+    # pause until this monotonic deadline. Shared across all SlackClient
+    # instances in the process (one bridge = one client, so effectively global).
+    _rate_limit_until: float = 0.0
+
     def __init__(self, token: str):
         self.token = token
 
     def _call(self, method: str, params: dict[str, str], post: bool = True) -> dict[str, Any]:
+        # Honor a prior ratelimited response before even trying.
+        wait = SlackClient._rate_limit_until - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
         url = SLACK_API + "/" + method
         headers = {"Authorization": f"Bearer {self.token}"}
         data = None
@@ -300,6 +372,12 @@ class SlackClient:
         except Exception:
             raise ApiError(f"slack.{method}", f"http {status} (non-json)")
         if not out.get("ok"):
+            # On ratelimited, read Retry-After (seconds) and set the global
+            # backoff so the next call waits. Slack sends it as a header and
+            # also in the JSON body for socket-mode-style calls.
+            if out.get("error") == "ratelimited":
+                retry_after = float(out.get("retry_after") or 1)
+                SlackClient._rate_limit_until = time.monotonic() + retry_after
             raise ApiError(f"slack.{method}", out.get("error", "unknown"), out)
         return out
 
@@ -354,6 +432,16 @@ class SlackClient:
         except ApiError:
             pass  # best-effort; some scopes/workspaces restrict this
 
+    def rename(self, channel_id: str, name: str) -> bool:
+        """Rename a channel. Returns True on success. Best-effort: a failure
+        (e.g. scope loss) is logged by the caller but never fatal."""
+        try:
+            self._call("conversations.rename", {"channel": channel_id, "name": name})
+            return True
+        except ApiError as e:
+            log(f"slack.rename {channel_id}: {e.err}")
+            return False
+
     def lookup_by_name(self, name: str, private: bool) -> str:
         types = "private_channel" if private else "public_channel"
         cursor = ""
@@ -375,12 +463,26 @@ class SlackClient:
 _SAFE = re.compile(r"[^a-z0-9_-]+")
 
 
-def channel_name(prefix: str, agent: str) -> str:
-    """Preferred channel name: #<prefix>-<agent>. The shortid is appended
-    only on a name conflict (see conflict_name), so the common case is short."""
-    parts = [prefix, agent]
-    cleaned = [_safe_part(p) for p in parts]
-    name = "-".join(p for p in cleaned if p)
+def _safe_part(s: str) -> str:
+    s = (s or "").lower().strip()
+    s = _SAFE.sub("-", s)
+    return re.sub(r"-+", "-", s).strip("-_")
+
+
+def _slug(s: str, max_len: int = 40) -> str:
+    """Slugify a string for use in a channel name, truncated to max_len."""
+    return _safe_part(s)[:max_len].rstrip("-_")
+
+
+def channel_name(prefix: str, project: str, title: str) -> str:
+    """Preferred channel name: #<prefix>-<project>-<title-slug>.
+    Falls back to #<prefix>-<title> when there's no project, then to
+    #<prefix>-<project> when there's no title. The shortid is appended only
+    on a name conflict (see conflict_name)."""
+    p = _slug(project, 30) if project else ""
+    t = _slug(title, 40) if title else ""
+    parts = [prefix, p, t]
+    name = "-".join(x for x in parts if x)
     name = _SAFE.sub("-", name)
     name = re.sub(r"-+", "-", name).strip("-_")
     if len(name) > 80:
@@ -388,16 +490,11 @@ def channel_name(prefix: str, agent: str) -> str:
     return name or "omnigent-agent"
 
 
-def conflict_name(prefix: str, agent: str, session_id: str) -> str:
-    """Fallback when #<prefix>-<agent> is taken: append the session shortid."""
+def conflict_name(prefix: str, project: str, title: str, session_id: str) -> str:
+    """Fallback when the preferred name is taken: append the session shortid."""
     short = (session_id or "")[-6:]
-    return channel_name(f"{prefix}-{agent}-{short}", "")
-
-
-def _safe_part(s: str) -> str:
-    s = (s or "").lower().strip()
-    s = _SAFE.sub("-", s)
-    return re.sub(r"-+", "-", s).strip("-_")
+    base = channel_name(prefix, project, title)
+    return f"{base}-{short}"[:80].rstrip("-_")
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -407,7 +504,7 @@ def _safe_part(s: str) -> str:
 @dataclass
 class SessionRecord:
     session_id: str
-    agent_name: str = ""
+    project: str = ""
     title: str = ""
     channel_id: str = ""
     channel_name: str = ""
@@ -449,7 +546,7 @@ class StateStore:
         for sid, r in (data.get("sessions") or {}).items():
             out.append(SessionRecord(
                 session_id=sid,
-                agent_name=r.get("agent_name", ""),
+                project=r.get("project", ""),
                 title=r.get("title", ""),
                 channel_id=r.get("channel_id", ""),
                 channel_name=r.get("channel_name", ""),
@@ -466,7 +563,7 @@ class StateStore:
         r = sessions.setdefault(sid, {"session_id": sid})
         return SessionRecord(
             session_id=sid,
-            agent_name=r.get("agent_name", ""),
+            project=r.get("project", ""),
             title=r.get("title", ""),
             channel_id=r.get("channel_id", ""),
             channel_name=r.get("channel_name", ""),
@@ -489,6 +586,26 @@ class Bridge:
         self.omni = OmnigentClient(cfg)
         self.slack = SlackClient(cfg.slack_bot_token)
         self.store = StateStore(cfg.state_dir)
+        self._projects: dict[str, str] | None = None  # project_id -> name cache
+
+    def _project_name(self, s: dict[str, Any]) -> str:
+        """Resolve a session's project to a human name, falling back to the
+        workspace basename (the repo dir) when it has no project."""
+        pid = s.get("project_id") or ""
+        if pid:
+            if self._projects is None:
+                try:
+                    self._projects = self.omni.list_projects()
+                except ApiError:
+                    self._projects = {}
+            name = self._projects.get(pid, "")
+            if name:
+                return name
+        # No project (or unresolvable): use the workspace dir basename.
+        ws = s.get("workspace") or ""
+        if ws:
+            return ws.rstrip("/").split("/")[-1]
+        return ""
 
     # -- outbound: watch sessions, alert + mirror ---------------------
 
@@ -508,7 +625,7 @@ class Bridge:
         sid = s.get("id") or ""
         if not sid:
             return
-        agent = s.get("agent_name") or "agent"
+        project = self._project_name(s)
         title = s.get("title") or ""
         status = s.get("status") or ""
         archived = bool(s.get("archived"))
@@ -516,11 +633,11 @@ class Bridge:
         blocked = status == "waiting" or pending > 0
 
         def write(sessions: dict[str, Any]) -> None:
-            self._mutate(sessions, sid, agent, title, status, archived, blocked, s)
+            self._mutate(sessions, sid, project, title, status, archived, blocked, s)
 
         self.store.update(write)
 
-    def _mutate(self, sessions, sid, agent, title, status, archived, blocked, s_raw) -> None:
+    def _mutate(self, sessions, sid, project, title, status, archived, blocked, s_raw) -> None:
         rec = self.store.get(sessions, sid)
         if rec.created_at == 0:
             sessions[sid]["created_at"] = int(time.time())
@@ -534,25 +651,27 @@ class Bridge:
             sessions[sid]["last_status"] = status
             return
 
-        # Agent rename → archive old channel, force a fresh one next.
-        # Detect by comparing agent names (not channel names): a suffixed
-        # conflict channel (e.g. #ck-pi-b8f1a7) must NOT look like a rename.
-        want_name = channel_name(self.cfg.prefix, agent)
-        if rec.channel_id and rec.agent_name and rec.agent_name != agent:
-            log(f"agent renamed: {rec.agent_name} -> {agent}; migrating")
-            if not rec.closed:
-                self.slack.post_message(rec.channel_id, f"📦 Agent renamed; moving to #{want_name}.")
-                self.slack.archive(rec.channel_id)
-            sessions[sid]["channel_id"] = ""
-            sessions[sid]["mentioned"] = False
-            sessions[sid]["last_mirror_id"] = ""
-            sessions[sid]["closed"] = False
-            rec = self.store.get(sessions, sid)  # refresh view
+        # The channel name tracks the current project + title, so a title
+        # change renames the channel live (Slack supports conversations.rename).
+        # A project change (rare) also renames. This keeps the channel name
+        # recognizable as Omnigent auto-renames the session.
+        want_name = channel_name(self.cfg.prefix, project, title)
 
-        sessions[sid]["agent_name"] = agent
+        # Project change while a channel exists: rename it to the new project.
+        if rec.channel_id and rec.project and rec.project != project:
+            log(f"project changed: {rec.project} -> {project}; renaming channel")
+            sessions[sid]["project"] = project
+
+        sessions[sid]["project"] = project
         sessions[sid]["title"] = title
-        # Keep the channel topic synced to the session title so the channel
-        # stays recognizable as Omnigent auto-renames the session.
+
+        # Rename the channel when the desired name diverges from the current one.
+        if rec.channel_id and rec.channel_name and rec.channel_name != want_name:
+            if self.slack.rename(rec.channel_id, want_name):
+                sessions[sid]["channel_name"] = want_name
+                rec = self.store.get(sessions, sid)
+
+        # Keep the channel topic synced to the session title too.
         if rec.channel_id and title and rec.title != title:
             self.slack.set_topic(rec.channel_id, title)
 
@@ -564,15 +683,16 @@ class Bridge:
 
         # Lazily create the channel on the first actionable event.
         if not rec.channel_id:
-            cid, cname = self._create_channel(want_name, agent, sid)
+            cid, cname = self._create_channel(want_name, project, title, sid)
             sessions[sid]["channel_id"] = cid
             sessions[sid]["channel_name"] = cname
             self.slack.invite_user(cid, self.cfg.slack_user_id)
-            intro = f"🚀 Channel for agent *{agent}* (`{sid[:8]}`)."
-            if title:
-                intro += f"\n*{title}*"
+            label = title or project or "session"
+            intro = f"🚀 Channel for *{label}* (`{sid[:8]}`)."
+            if project:
+                intro += f"\nProject: *{project}*"
             self.slack.post_message(cid, intro)
-            self.slack.set_topic(cid, title or agent)
+            self.slack.set_topic(cid, title or project)
             # Seed last_mirror_id to the newest item so we only mirror turns
             # that happen AFTER the channel exists (no history dump).
             try:
@@ -587,7 +707,7 @@ class Bridge:
         # Alert on blocked/failed (mention once per channel).
         if is_alert:
             mention = blocked and not rec.mentioned
-            text = self._alert_text(agent, title, sid, status, mention)
+            text = self._alert_text(title, project, sid, status, mention)
             if mention:
                 sessions[sid]["mentioned"] = True
             ts = self.slack.post_message(cid, text)
@@ -608,7 +728,7 @@ class Bridge:
                 sessions[sid]["last_mirror_id"] = new_last_id or rec.last_mirror_id
         sessions[sid]["last_status"] = status
 
-    def _create_channel(self, name: str, agent: str, sid: str) -> tuple[str, str]:
+    def _create_channel(self, name: str, project: str, title: str, sid: str) -> tuple[str, str]:
         """Create the channel, falling back to a shortid-suffixed name on a
         conflict. Returns (channel_id, actual_name_used)."""
         try:
@@ -621,19 +741,18 @@ class Bridge:
                     return cid, name
                 # Name taken by another session's channel: fall back to the
                 # shortid-suffixed name so this session still gets its own.
-                fb = conflict_name(self.cfg.prefix, agent, sid)
+                fb = conflict_name(self.cfg.prefix, project, title, sid)
                 return self.slack.create_channel(fb, self.cfg.private), fb
             raise
 
-    def _alert_text(self, agent, title, sid, status, mention) -> str:
+    def _alert_text(self, title, project, sid, status, mention) -> str:
+        label = title or project or "session"
         if status == "failed":
-            head = f"🔴 *{agent}* *failed* (`{sid[:8]}`)"
+            head = f"🔴 *{label}* *failed* (`{sid[:8]}`)"
         else:
-            head = f"🟡 *{agent}* is *blocked* — needs you (`{sid[:8]}`)"
+            head = f"🟡 *{label}* is *blocked* — needs you (`{sid[:8]}`)"
             if mention:
                 head += f"  <@{self.cfg.slack_user_id}>"
-        if title:
-            head += f"\n*{title}*"
         return head
 
     def _new_assistant_text(self, sid: str, last_id: str) -> tuple[str, str]:
@@ -669,6 +788,9 @@ class Bridge:
     # -- inbound: forward Slack replies into sessions -----------------
 
     def tick_inbound(self) -> None:
+        # Skip the whole inbound pass while a Slack rate-limit backoff is active.
+        if SlackClient._rate_limit_until > time.monotonic():
+            return
         for rec in self.store.records():
             if rec.closed or not rec.channel_id:
                 continue
@@ -677,6 +799,8 @@ class Bridge:
             except ApiError as e:
                 if e.err in ("channel_archived", "channel_not_found", "method_not_supported_for_channel_type"):
                     self._set_field(rec.session_id, "closed", True)
+                elif e.err == "ratelimited":
+                    return  # _call already set the backoff; stop this pass
                 else:
                     log(f"inbound: {rec.channel_name}: {e}")
             except Exception as e:
@@ -721,10 +845,13 @@ class Bridge:
     # -- main loop ----------------------------------------------------
 
     def run(self) -> None:
-        log(f"omnigent-slack-bridge started; server={self.cfg.server_url} prefix={self.cfg.prefix} interval={self.cfg.poll_interval}s")
+        log(f"omnigent-slack-bridge started; server={self.cfg.server_url} prefix={self.cfg.prefix} interval={self.cfg.poll_interval}s inbound={self.cfg.inbound_interval}s")
+        last_inbound = 0.0
         while True:
             self.tick_outbound()
-            self.tick_inbound()
+            if time.monotonic() - last_inbound >= self.cfg.inbound_interval:
+                self.tick_inbound()
+                last_inbound = time.monotonic()
             time.sleep(max(1, self.cfg.poll_interval))
 
 
@@ -778,7 +905,7 @@ def cmd_status(cfg: Config) -> int:
     print(f"sessions ({len(recs)}):")
     for r in recs:
         flag = "closed" if r.closed else "open"
-        print(f"  - {r.session_id[:12]}  agent={r.agent_name}  channel=#{r.channel_name}  status={r.last_status}  {flag}")
+        print(f"  - {r.session_id[:12]}  project={r.project}  title={r.title[:30]}  channel=#{r.channel_name}  status={r.last_status}  {flag}")
     return 0
 
 

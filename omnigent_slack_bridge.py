@@ -688,19 +688,37 @@ class Bridge:
 
         self.store.update(write)
 
+    def _handle_session_removed(self, sid: str) -> None:
+        """A session was deleted from Omnigent. Archive its Slack channel
+        (Slack doesn't allow bot tokens to delete channels, only archive)."""
+        def write(sessions: dict[str, Any]) -> None:
+            rec = self.store.get(sessions, sid)
+            if rec.channel_id and not rec.closed:
+                self.slack.post_message(rec.channel_id, "📦 session deleted; archiving this channel.")
+                self.slack.archive(rec.channel_id)
+                sessions[sid]["closed"] = True
+                log(f"outbound: session {sid[:12]} deleted; archived #{rec.channel_name}")
+        self.store.update(write)
+
     def _mutate(self, sessions, sid, project, title, status, archived, blocked, s_raw) -> None:
         rec = self.store.get(sessions, sid)
         if rec.created_at == 0:
             sessions[sid]["created_at"] = int(time.time())
 
-        # Archived / closed session: archive its channel if open.
+        # Archived session: archive its channel. Unarchived: unarchive it.
         if archived:
             if rec.channel_id and not rec.closed:
-                self.slack.post_message(rec.channel_id, f"📦 session archived; archiving this channel.")
+                self.slack.post_message(rec.channel_id, "📦 session archived; archiving this channel.")
                 self.slack.archive(rec.channel_id)
                 sessions[sid]["closed"] = True
             sessions[sid]["last_status"] = status
             return
+        else:
+            # Session unarchived: unarchive the channel if it was closed.
+            if rec.channel_id and rec.closed:
+                self.slack.unarchive(rec.channel_id)
+                sessions[sid]["closed"] = False
+                self.slack.post_message(rec.channel_id, "📦 session unarchived; channel reopened.")
 
         # The channel name tracks the current project + title, so a title
         # change renames the channel live (Slack supports conversations.rename).
@@ -994,7 +1012,14 @@ class Bridge:
                         watched.extend(new_ids)
                         await ws.send(json.dumps({"type": "watch", "session_ids": watched}))
                         log(f"outbound: discovered {len(new_ids)} new session(s); now watching {len(watched)}")
-                # heartbeat / removed frames need no action.
+                elif ftype == "removed":
+                    # Session was deleted — archive its Slack channel (Slack
+                    # doesn't allow bot tokens to delete channels, only archive).
+                    ids = frame.get("ids", [])
+                    for sid in ids:
+                        await asyncio.to_thread(self._handle_session_removed, sid)
+                        if sid in watched:
+                            watched.remove(sid)
 
     def run(self) -> None:
         mode = "socket-mode" if self.cfg.slack_app_token else "polling"

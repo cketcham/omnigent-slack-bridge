@@ -1,0 +1,7 @@
+# Local config / state (if copied here during dev)
+.env
+config.env
+state.json
+*.log
+__pycache__/
+*.pyc

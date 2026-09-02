@@ -1,0 +1,952 @@
+#!/usr/bin/env python3
+"""omnigent-slack-bridge — per-agent Slack channels for Omnigent sessions.
+
+A standalone daemon that watches your Omnigent sessions and gives each one a
+Slack channel. When a session is *waiting* (blocked on you) it pings you; when
+a turn ends (*idle*) it mirrors the agent's new assistant output into the
+channel so you can see the reply from your phone. You reply top-level in the
+channel and the text is forwarded into the session as a user message via
+``POST /v1/sessions/{id}/events``.
+
+Channel names: ``#<prefix>-<agent_name>-<shortid>`` e.g. ``#ck-pi-native-ui-b8f1a7``.
+Routing is by channel id stored in local state (the session id is the key).
+
+Pure stdlib (urllib + json) so there is nothing to pip install. Talks to the
+Omnigent HTTP API (Bearer JWT from ``~/.omnigent/auth_tokens.json``) and the
+Slack Web API (bot token). No plugin hooks, no socket paths, no tmux.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+# ──────────────────────────────────────────────────────────────────────────
+# Config
+# ──────────────────────────────────────────────────────────────────────────
+
+DEFAULT_PREFIX = "ck"
+DEFAULT_POLL_INTERVAL = 5  # seconds between ticks
+
+
+def _default_config_dir() -> str:
+    return str(Path.home() / ".config" / "omnigent-slack-bridge")
+
+
+def _default_state_dir() -> str:
+    return str(Path.home() / ".local" / "share" / "omnigent-slack-bridge")
+
+
+def _default_server_url() -> str:
+    """Read the configured Omnigent server from ~/.omnigent/config.yaml."""
+    path = Path.home() / ".omnigent" / "config.yaml"
+    if not path.exists():
+        return ""
+    try:
+        import yaml  # part of the omnigent install; optional
+        with open(path) as f:
+            cfg = yaml.safe_load(f) or {}
+        return cfg.get("server") or ""
+    except Exception:
+        # Fall back to a naive regex if pyyaml isn't importable.
+        try:
+            text = path.read_text()
+            m = re.search(r"^server:\s*(\S+)", text, re.MULTILINE)
+            return m.group(1) if m else ""
+        except Exception:
+            return ""
+
+
+def _load_token(server_url: str) -> str:
+    """Read the bearer JWT for ``server_url`` from ~/.omnigent/auth_tokens.json."""
+    path = Path.home() / ".omnigent" / "auth_tokens.json"
+    if not path.exists():
+        return ""
+    try:
+        data = json.loads(path.read_text())
+        entry = data.get(server_url) or {}
+        return entry.get("token") or ""
+    except Exception:
+        return ""
+
+
+@dataclass
+class Config:
+    slack_bot_token: str = ""
+    slack_user_id: str = ""
+    prefix: str = DEFAULT_PREFIX
+    private: bool = False
+    server_url: str = ""
+    auth_token: str = ""
+    poll_interval: int = DEFAULT_POLL_INTERVAL
+    allowed_users: list[str] = field(default_factory=list)
+    state_dir: str = _default_state_dir()
+    project: str = ""  # optional Omnigent project filter
+
+    def validate(self) -> list[str]:
+        missing = []
+        if not self.slack_bot_token:
+            missing.append("SLACK_BOT_TOKEN")
+        if not self.prefix:
+            missing.append("OMNIGENT_SLACK_BRIDGE_PREFIX")
+        if not self.server_url:
+            missing.append("OMNIGENT_SERVER_URL (or ~/.omnigent/config.yaml server)")
+        return missing
+
+
+def _env_file_paths() -> list[str]:
+    paths = []
+    if os.environ.get("OMNIGENT_SLACK_BRIDGE_CONFIG_DIR"):
+        paths.append(os.path.join(os.environ["OMNIGENT_SLACK_BRIDGE_CONFIG_DIR"], "config.env"))
+    paths.append(os.path.join(_default_config_dir(), "config.env"))
+    return paths
+
+
+def _load_env_file(path: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    try:
+        text = Path(path).read_text()
+    except OSError:
+        return out
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        out[k.strip()] = v.strip().strip("\"'")
+    return out
+
+
+def load_config() -> Config:
+    merged: dict[str, str] = {}
+    for p in _env_file_paths():
+        merged.update(_load_env_file(p))
+    merged.update({k: v for k, v in os.environ.items()})
+
+    def get(k: str) -> str:
+        return merged.get(k, "")
+
+    server_url = get("OMNIGENT_SERVER_URL") or _default_server_url()
+    auth_token = get("OMNIGENT_AUTH_TOKEN") or _load_token(server_url)
+
+    c = Config(
+        slack_bot_token=get("SLACK_BOT_TOKEN"),
+        slack_user_id=get("SLACK_USER_ID"),
+        prefix=get("OMNIGENT_SLACK_BRIDGE_PREFIX") or DEFAULT_PREFIX,
+        private=_bool(get("OMNIGENT_SLACK_BRIDGE_PRIVATE")),
+        server_url=server_url,
+        auth_token=auth_token,
+        poll_interval=_int(get("OMNIGENT_SLACK_BRIDGE_POLL_INTERVAL"), DEFAULT_POLL_INTERVAL),
+        allowed_users=_list(get("OMNIGENT_SLACK_BRIDGE_ALLOWED_USERS")),
+        state_dir=get("OMNIGENT_SLACK_BRIDGE_STATE_DIR") or _default_state_dir(),
+        project=get("OMNIGENT_SLACK_BRIDGE_PROJECT"),
+    )
+    return c
+
+
+def _bool(v: str) -> bool:
+    return v.lower() in ("1", "true", "yes", "on")
+
+
+def _int(v: str, default: int) -> int:
+    try:
+        return int(v) if v.strip() else default
+    except ValueError:
+        return default
+
+
+def _list(v: str) -> list[str]:
+    return [p.strip() for p in v.split(",") if p.strip()]
+
+
+def _first_nonempty(*vals: str) -> str:
+    for v in vals:
+        if v:
+            return v
+    return ""
+
+
+def _mask(t: str) -> str:
+    if not t:
+        return "(unset)"
+    if len(t) <= 10:
+        return "***"
+    return t[:6] + "..." + t[-4:]
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# HTTP helpers (stdlib only)
+# ──────────────────────────────────────────────────────────────────────────
+
+class ApiError(Exception):
+    def __init__(self, source: str, err: str, payload: Any = None):
+        super().__init__(f"{source}: {err}")
+        self.source = source
+        self.err = err
+        self.payload = payload
+
+
+def _http_request(method: str, url: str, headers: dict[str, str], body: bytes | None) -> tuple[int, bytes]:
+    req = urllib.request.Request(url, data=body, method=method)
+    for k, v in headers.items():
+        req.add_header(k, v)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return resp.status, resp.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+    except urllib.error.URLError as e:
+        raise ApiError("http", str(e))
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Omnigent client
+# ──────────────────────────────────────────────────────────────────────────
+
+class OmnigentClient:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.base = cfg.server_url.rstrip("/")
+        self._token = cfg.auth_token
+
+    @property
+    def token(self) -> str:
+        return self._token
+
+    def _reload_token(self) -> bool:
+        """Re-read the JWT from disk (the CLI may have refreshed it)."""
+        t = _load_token(self.cfg.server_url)
+        if t and t != self._token:
+            self._token = t
+            return True
+        return False
+
+    def _headers(self) -> dict[str, str]:
+        return {"Authorization": f"Bearer {self._token}", "Content-Type": "application/json"}
+
+    def _call(self, method: str, path: str, query: dict[str, str] | None = None, body: Any = None) -> Any:
+        url = self.base + path
+        if query:
+            url += "?" + urllib.parse.urlencode(query)
+        data = json.dumps(body).encode() if body is not None else None
+        for attempt in range(2):
+            status, raw = _http_request(method, url, self._headers(), data)
+            if status == 401 and attempt == 0 and self._reload_token():
+                continue  # retry once with a refreshed token
+            if status == 401:
+                raise ApiError("omnigent", "auth_expired (run `omnigent login`)", raw.decode(errors="replace"))
+            if 200 <= status < 300:
+                if not raw:
+                    return None
+                return json.loads(raw.decode())
+            raise ApiError("omnigent", f"http {status}", raw.decode(errors="replace"))
+        raise ApiError("omnigent", "unreachable")
+
+    def list_my_sessions(self, limit: int = 100) -> list[dict[str, Any]]:
+        """Top-level sessions I can see (kind=default excludes sub-agents)."""
+        params = {"limit": str(limit), "kind": "default", "order": "desc", "sort_by": "updated_at"}
+        if self.cfg.project:
+            params["project"] = self.cfg.project
+        res = self._call("GET", "/v1/sessions", params)
+        return res.get("data", []) if res else []
+
+    def list_items(self, session_id: str, limit: int = 200, order: str = "asc", after: str = "") -> list[dict[str, Any]]:
+        params = {"limit": str(limit), "order": order}
+        if after:
+            params["after"] = after
+        res = self._call("GET", f"/v1/sessions/{session_id}/items", params)
+        return res.get("data", []) if res else []
+
+    def send_message(self, session_id: str, text: str) -> None:
+        self._call("POST", f"/v1/sessions/{session_id}/events", body={
+            "type": "message",
+            "data": {"role": "user", "content": [{"type": "input_text", "text": text}]},
+        })
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Slack client (Web API, stdlib only)
+# ──────────────────────────────────────────────────────────────────────────
+
+SLACK_API = "https://slack.com/api"
+
+
+class SlackClient:
+    def __init__(self, token: str):
+        self.token = token
+
+    def _call(self, method: str, params: dict[str, str], post: bool = True) -> dict[str, Any]:
+        url = SLACK_API + "/" + method
+        headers = {"Authorization": f"Bearer {self.token}"}
+        data = None
+        if post:
+            data = urllib.parse.urlencode(params).encode()
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+        else:
+            url += "?" + urllib.parse.urlencode(params)
+        status, raw = _http_request("POST" if post else "GET", url, headers, data)
+        try:
+            out = json.loads(raw.decode())
+        except Exception:
+            raise ApiError(f"slack.{method}", f"http {status} (non-json)")
+        if not out.get("ok"):
+            raise ApiError(f"slack.{method}", out.get("error", "unknown"), out)
+        return out
+
+    def create_channel(self, name: str, private: bool) -> str:
+        params = {"name": name}
+        if private:
+            params["is_private"] = "true"
+        res = self._call("conversations.create", params)
+        ch = res.get("channel") or {}
+        cid = ch.get("id") or ""
+        if not cid:
+            raise ApiError("slack.create", "no channel id")
+        return cid
+
+    def invite_user(self, channel_id: str, user_id: str) -> None:
+        if not user_id:
+            return
+        try:
+            self._call("conversations.invite", {"channel": channel_id, "users": user_id})
+        except ApiError as e:
+            if e.err not in ("already_in_channel", "is_archived"):
+                raise
+
+    def post_message(self, channel_id: str, text: str) -> str:
+        res = self._call("chat.postMessage", {"channel": channel_id, "text": text})
+        return res.get("ts") or ""
+
+    def history(self, channel_id: str, oldest: str, limit: int = 50) -> list[dict[str, Any]]:
+        params = {"channel": channel_id, "limit": str(limit)}
+        if oldest:
+            params["oldest"] = oldest
+        res = self._call("conversations.history", params, post=False)
+        return res.get("messages") or []
+
+    def archive(self, channel_id: str) -> None:
+        try:
+            self._call("conversations.archive", {"channel": channel_id})
+        except ApiError as e:
+            if e.err != "already_archived":
+                raise
+
+    def unarchive(self, channel_id: str) -> None:
+        try:
+            self._call("conversations.unarchive", {"channel": channel_id})
+        except ApiError as e:
+            if e.err != "not_archived":
+                raise
+
+    def set_topic(self, channel_id: str, topic: str) -> None:
+        try:
+            self._call("conversations.setTopic", {"channel": channel_id, "topic": topic[:1024]})
+        except ApiError:
+            pass  # best-effort; some scopes/workspaces restrict this
+
+    def lookup_by_name(self, name: str, private: bool) -> str:
+        types = "private_channel" if private else "public_channel"
+        cursor = ""
+        for _ in range(20):
+            res = self._call("conversations.list", {"limit": "200", "types": types, "cursor": cursor}, post=False)
+            for ch in res.get("channels") or []:
+                if (ch.get("name") or "").lower() == name.lower():
+                    return ch.get("id") or ""
+            cursor = (res.get("response_metadata") or {}).get("next_cursor") or ""
+            if not cursor:
+                break
+        return ""
+
+    def create_unique(self, base: str, private: bool) -> tuple[str, str]:
+        name = base
+        for suffix in range(2, 21):
+            try:
+                return self.create_channel(name, private), name
+            except ApiError as e:
+                if e.err != "name_taken":
+                    raise
+                name = f"{base}-{suffix}"
+        raise ApiError("slack.create", f"could not create unique channel for {base}")
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Channel naming
+# ──────────────────────────────────────────────────────────────────────────
+
+_SAFE = re.compile(r"[^a-z0-9_-]+")
+
+
+def channel_name(prefix: str, agent: str, session_id: str) -> str:
+    short = (session_id or "")[-6:]
+    parts = [prefix, agent, short]
+    cleaned = [_safe_part(p) for p in parts]
+    name = "-".join(p for p in cleaned if p)
+    name = _SAFE.sub("-", name)
+    name = re.sub(r"-+", "-", name).strip("-_")
+    if len(name) > 80:
+        name = name[:80].rstrip("-_")
+    return name or "omnigent-agent"
+
+
+def _safe_part(s: str) -> str:
+    s = (s or "").lower().strip()
+    s = _SAFE.sub("-", s)
+    return re.sub(r"-+", "-", s).strip("-_")
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# State
+# ──────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class SessionRecord:
+    session_id: str
+    agent_name: str = ""
+    title: str = ""
+    channel_id: str = ""
+    channel_name: str = ""
+    last_status: str = ""
+    last_mirror_id: str = ""
+    last_seen_ts: str = ""
+    mentioned: bool = False
+    closed: bool = False
+    created_at: int = 0
+
+
+class StateStore:
+    def __init__(self, dirpath: str):
+        self.path = os.path.join(dirpath, "state.json")
+        os.makedirs(dirpath, exist_ok=True)
+
+    def _load(self) -> dict[str, Any]:
+        try:
+            return json.loads(Path(self.path).read_text())
+        except OSError:
+            return {"sessions": {}}
+        except json.JSONDecodeError:
+            return {"sessions": {}}
+
+    def _save(self, data: dict[str, Any]) -> None:
+        tmp = self.path + ".tmp"
+        Path(tmp).write_text(json.dumps(data, indent=2))
+        os.replace(tmp, self.path)
+
+    def update(self, fn) -> None:
+        data = self._load()
+        sessions: dict[str, Any] = data.setdefault("sessions", {})
+        fn(sessions)
+        self._save(data)
+
+    def records(self) -> list[SessionRecord]:
+        data = self._load()
+        out = []
+        for sid, r in (data.get("sessions") or {}).items():
+            out.append(SessionRecord(
+                session_id=sid,
+                agent_name=r.get("agent_name", ""),
+                title=r.get("title", ""),
+                channel_id=r.get("channel_id", ""),
+                channel_name=r.get("channel_name", ""),
+                last_status=r.get("last_status", ""),
+                last_mirror_id=r.get("last_mirror_id", ""),
+                last_seen_ts=r.get("last_seen_ts", ""),
+                mentioned=r.get("mentioned", False),
+                closed=r.get("closed", False),
+                created_at=r.get("created_at", 0),
+            ))
+        return out
+
+    def get(self, sessions: dict[str, Any], sid: str) -> SessionRecord:
+        r = sessions.setdefault(sid, {"session_id": sid})
+        return SessionRecord(
+            session_id=sid,
+            agent_name=r.get("agent_name", ""),
+            title=r.get("title", ""),
+            channel_id=r.get("channel_id", ""),
+            channel_name=r.get("channel_name", ""),
+            last_status=r.get("last_status", ""),
+            last_mirror_id=r.get("last_mirror_id", ""),
+            last_seen_ts=r.get("last_seen_ts", ""),
+            mentioned=r.get("mentioned", False),
+            closed=r.get("closed", False),
+            created_at=r.get("created_at", 0),
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Bridge
+# ──────────────────────────────────────────────────────────────────────────
+
+class Bridge:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.omni = OmnigentClient(cfg)
+        self.slack = SlackClient(cfg.slack_bot_token)
+        self.store = StateStore(cfg.state_dir)
+
+    # -- outbound: watch sessions, alert + mirror ---------------------
+
+    def tick_outbound(self) -> None:
+        try:
+            sessions = self.omni.list_my_sessions()
+        except ApiError as e:
+            log(f"outbound: list sessions failed: {e}")
+            return
+        for s in sessions:
+            try:
+                self._handle_session(s)
+            except Exception as e:
+                log(f"outbound: session {s.get('id')}: {e}")
+
+    def _handle_session(self, s: dict[str, Any]) -> None:
+        sid = s.get("id") or ""
+        if not sid:
+            return
+        agent = s.get("agent_name") or "agent"
+        title = s.get("title") or ""
+        status = s.get("status") or ""
+        archived = bool(s.get("archived"))
+        pending = int(s.get("pending_elicitations_count") or 0)
+        blocked = status == "waiting" or pending > 0
+
+        def write(sessions: dict[str, Any]) -> None:
+            self._mutate(sessions, sid, agent, title, status, archived, blocked, s)
+
+        self.store.update(write)
+
+    def _mutate(self, sessions, sid, agent, title, status, archived, blocked, s_raw) -> None:
+        rec = self.store.get(sessions, sid)
+        if rec.created_at == 0:
+            sessions[sid]["created_at"] = int(time.time())
+
+        # Archived / closed session: archive its channel if open.
+        if archived:
+            if rec.channel_id and not rec.closed:
+                self.slack.post_message(rec.channel_id, f"📦 session archived; archiving this channel.")
+                self.slack.archive(rec.channel_id)
+                sessions[sid]["closed"] = True
+            sessions[sid]["last_status"] = status
+            return
+
+        # Agent rename → archive old channel, force a fresh one next.
+        want_name = channel_name(self.cfg.prefix, agent, sid)
+        if rec.channel_id and rec.channel_name and rec.channel_name != want_name:
+            log(f"agent renamed: {rec.channel_name} -> {want_name}; migrating")
+            if not rec.closed:
+                self.slack.post_message(rec.channel_id, f"📦 Agent renamed; moving to #{want_name}.")
+                self.slack.archive(rec.channel_id)
+            sessions[sid]["channel_id"] = ""
+            sessions[sid]["mentioned"] = False
+            sessions[sid]["last_mirror_id"] = ""
+            sessions[sid]["closed"] = False
+            rec = self.store.get(sessions, sid)  # refresh view
+
+        sessions[sid]["agent_name"] = agent
+        sessions[sid]["title"] = title
+        # Keep the channel topic synced to the session title so the channel
+        # stays recognizable as Omnigent auto-renames the session.
+        if rec.channel_id and title and rec.title != title:
+            self.slack.set_topic(rec.channel_id, title)
+
+        is_turn_end = status == "idle"
+        is_alert = blocked or status == "failed"
+        if not (is_alert or is_turn_end):
+            sessions[sid]["last_status"] = status
+            return  # running / unknown — nothing to say
+
+        # Lazily create the channel on the first actionable event.
+        if not rec.channel_id:
+            cid = self._create_channel(want_name)
+            sessions[sid]["channel_id"] = cid
+            sessions[sid]["channel_name"] = want_name
+            self.slack.invite_user(cid, self.cfg.slack_user_id)
+            intro = f"🚀 Channel for agent *{agent}* (`{sid[:8]}`)."
+            if title:
+                intro += f"\n*{title}*"
+            self.slack.post_message(cid, intro)
+            self.slack.set_topic(cid, title or agent)
+            # Seed last_mirror_id to the newest item so we only mirror turns
+            # that happen AFTER the channel exists (no history dump).
+            try:
+                latest = self.omni.list_items(sid, limit=1, order="desc")
+                if latest:
+                    sessions[sid]["last_mirror_id"] = latest[0].get("id", "")
+            except ApiError as e:
+                log(f"seed last_mirror_id {sid}: {e}")
+
+        cid = sessions[sid]["channel_id"]
+
+        # Alert on blocked/failed (mention once per channel).
+        if is_alert:
+            mention = blocked and not rec.mentioned
+            text = self._alert_text(agent, title, sid, status, mention)
+            if mention:
+                sessions[sid]["mentioned"] = True
+            ts = self.slack.post_message(cid, text)
+            if _ts_greater(ts, rec.last_seen_ts):
+                sessions[sid]["last_seen_ts"] = ts
+            sessions[sid]["last_status"] = status
+            return
+
+        # Turn-end: mirror new assistant output.
+        if is_turn_end and rec.last_status != "idle":
+            new_text, new_last_id = self._new_assistant_text(sid, rec.last_mirror_id)
+            if new_text.strip():
+                mts = self.slack.post_message(cid, new_text)
+                sessions[sid]["last_mirror_id"] = new_last_id
+                if _ts_greater(mts, rec.last_seen_ts):
+                    sessions[sid]["last_seen_ts"] = mts
+            else:
+                sessions[sid]["last_mirror_id"] = new_last_id or rec.last_mirror_id
+        sessions[sid]["last_status"] = status
+
+    def _create_channel(self, name: str) -> str:
+        try:
+            return self.slack.create_channel(name, self.cfg.private)
+        except ApiError as e:
+            if e.err == "name_taken":
+                cid = self.slack.lookup_by_name(name, self.cfg.private)
+                if cid:
+                    self.slack.unarchive(cid)
+                    return cid
+                return self.slack.create_unique(name, self.cfg.private)[0]
+            raise
+
+    def _alert_text(self, agent, title, sid, status, mention) -> str:
+        if status == "failed":
+            head = f"🔴 *{agent}* *failed* (`{sid[:8]}`)"
+        else:
+            head = f"🟡 *{agent}* is *blocked* — needs you (`{sid[:8]}`)"
+            if mention:
+                head += f"  <@{self.cfg.slack_user_id}>"
+        if title:
+            head += f"\n*{title}*"
+        return head
+
+    def _new_assistant_text(self, sid: str, last_id: str) -> tuple[str, str]:
+        """Return (concatenated new assistant text, new last item id).
+
+        Uses the server-side ``after`` cursor (order=asc) so every returned
+        item is strictly newer than ``last_id`` — no fragile id comparison.
+        """
+        texts: list[str] = []
+        new_last = last_id
+        cursor = last_id
+        for _ in range(5):  # bounded pagination across a long turn
+            try:
+                items = self.omni.list_items(sid, limit=200, order="asc", after=cursor)
+            except ApiError as e:
+                log(f"mirror: list items {sid}: {e}")
+                return "\n\n".join(texts), new_last
+            if not items:
+                break
+            for it in items:
+                if it.get("type") == "message" and it.get("role") == "assistant":
+                    for block in it.get("content") or []:
+                        if block.get("type") in ("output_text", "text"):
+                            t = (block.get("text") or "").strip()
+                            if t:
+                                texts.append(t)
+                new_last = it.get("id", "") or new_last
+            cursor = new_last
+            if len(items) < 200:
+                break
+        return "\n\n".join(texts), new_last
+
+    # -- inbound: forward Slack replies into sessions -----------------
+
+    def tick_inbound(self) -> None:
+        for rec in self.store.records():
+            if rec.closed or not rec.channel_id:
+                continue
+            try:
+                self._poll_channel(rec)
+            except ApiError as e:
+                if e.err in ("channel_archived", "channel_not_found", "method_not_supported_for_channel_type"):
+                    self._set_field(rec.session_id, "closed", True)
+                else:
+                    log(f"inbound: {rec.channel_name}: {e}")
+            except Exception as e:
+                log(f"inbound: {rec.channel_name}: {e}")
+
+    def _poll_channel(self, rec: SessionRecord) -> None:
+        msgs = self.slack.history(rec.channel_id, rec.last_seen_ts, limit=50)
+        newest = rec.last_seen_ts
+        for m in msgs:
+            ts = m.get("ts") or ""
+            if not _ts_greater(ts, rec.last_seen_ts):
+                continue
+            if m.get("bot_id") or m.get("subtype"):
+                if _ts_greater(ts, newest):
+                    newest = ts
+                continue
+            user = m.get("user") or ""
+            if not self._user_allowed(user):
+                if _ts_greater(ts, newest):
+                    newest = ts
+                continue
+            text = (m.get("text") or "").strip()
+            if not text:
+                continue
+            try:
+                self.omni.send_message(rec.session_id, text)
+            except ApiError as e:
+                log(f"inbound: forward to {rec.session_id}: {e}")
+            if _ts_greater(ts, newest):
+                newest = ts
+        if newest != rec.last_seen_ts:
+            self._set_field(rec.session_id, "last_seen_ts", newest)
+
+    def _user_allowed(self, user: str) -> bool:
+        if not self.cfg.allowed_users:
+            return user != ""
+        return user in self.cfg.allowed_users
+
+    def _set_field(self, sid: str, key: str, value: Any) -> None:
+        self.store.update(lambda sess: sess.setdefault(sid, {}).__setitem__(key, value))
+
+    # -- main loop ----------------------------------------------------
+
+    def run(self) -> None:
+        log(f"omnigent-slack-bridge started; server={self.cfg.server_url} prefix={self.cfg.prefix} interval={self.cfg.poll_interval}s")
+        while True:
+            self.tick_outbound()
+            self.tick_inbound()
+            time.sleep(max(1, self.cfg.poll_interval))
+
+
+def _ts_greater(a: str, b: str) -> bool:
+    if not a:
+        return False
+    if not b:
+        return True
+    try:
+        return float(a) > float(b)
+    except ValueError:
+        return a > b
+
+
+def log(msg: str) -> None:
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", file=sys.stderr, flush=True)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# CLI
+# ──────────────────────────────────────────────────────────────────────────
+
+def cmd_poll(cfg: Config) -> int:
+    missing = cfg.validate()
+    if missing:
+        log(f"missing config: {', '.join(missing)}")
+        return 1
+    if not cfg.auth_token:
+        log("no auth token — run `omnigent login` (or set OMNIGENT_AUTH_TOKEN)")
+        return 1
+    Bridge(cfg).run()
+
+
+def cmd_status(cfg: Config) -> int:
+    print(f"config dir: {_default_config_dir()}")
+    print(f"state dir:  {cfg.state_dir}")
+    print(f"server:     {cfg.server_url}")
+    print(f"prefix:     {cfg.prefix}")
+    print(f"private:    {cfg.private}")
+    print(f"poll:       {cfg.poll_interval}s")
+    print(f"allowed:    {cfg.allowed_users or '(any non-bot user)'}")
+    print(f"bot token:  {_mask(cfg.slack_bot_token)}")
+    print(f"user id:     {cfg.slack_user_id or '(unset)'}")
+    print(f"auth token: {_mask(cfg.auth_token)}")
+    print(f"project:    {cfg.project or '(none — all my sessions)'}")
+    print()
+    recs = StateStore(cfg.state_dir).records()
+    if not recs:
+        print("sessions: (none tracked yet)")
+        return 0
+    print(f"sessions ({len(recs)}):")
+    for r in recs:
+        flag = "closed" if r.closed else "open"
+        print(f"  - {r.session_id[:12]}  agent={r.agent_name}  channel=#{r.channel_name}  status={r.last_status}  {flag}")
+    return 0
+
+
+def cmd_auth(cfg: Config) -> int:
+    sc = SlackClient(cfg.slack_bot_token)
+    try:
+        res = sc._call("auth.test", {})
+        print(f"auth.test ok={res.get('ok')} team={res.get('team')} user={res.get('user_id')} url={res.get('url')}")
+    except ApiError as e:
+        print(f"auth.test FAILED: {e}")
+        return 1
+    if cfg.server_url:
+        oc = OmnigentClient(cfg)
+        try:
+            oc.list_my_sessions(limit=1)
+            print(f"omnigent: ok (server={cfg.server_url}, token={_mask(oc.token)})")
+        except ApiError as e:
+            print(f"omnigent FAILED: {e}")
+            return 1
+    return 0
+
+
+def cmd_scopes(cfg: Config) -> int:
+    sc = SlackClient(cfg.slack_bot_token)
+    probes = [
+        ("conversations.list (channels:read)", "conversations.list", {"limit": "1", "types": "public_channel"}, False),
+        ("conversations.create (channels:manage)", "conversations.create", {"name": "__omni_scope_probe__"}, True),
+        ("conversations.history (channels:history)", "conversations.history", {"channel": "__none__", "limit": "1"}, False),
+        ("conversations.invite (invites:write)", "conversations.invite", {"channel": "__none__", "users": cfg.slack_user_id}, True),
+        ("conversations.setTopic (channels:manage)", "conversations.setTopic", {"channel": "__none__", "topic": "x"}, True),
+    ]
+    for name, method, params, post in probes:
+        try:
+            sc._call(method, params, post=post)
+            print(f"{name:45s} OK")
+        except ApiError as e:
+            print(f"{name:45s} {e.err}")
+    return 0
+
+
+def cmd_verify(cfg: Config) -> int:
+    sc = SlackClient(cfg.slack_bot_token)
+    recs = StateStore(cfg.state_dir).records()
+    if not recs:
+        print("no sessions tracked")
+        return 1
+    for r in recs:
+        print(f"\n{r.session_id[:12]} -> #{r.channel_name} id={r.channel_id} status={r.last_status} closed={r.closed}")
+        if not r.channel_id or r.closed:
+            print("  (no channel / closed)")
+            continue
+        try:
+            msgs = sc.history(r.channel_id, "", limit=10)
+        except ApiError as e:
+            print(f"  history FAILED: {e}")
+            continue
+        for m in msgs:
+            src = "bot" if m.get("bot_id") else f"user:{m.get('user')}"
+            text = (m.get("text") or "").replace("\n", " / ")
+            print(f"  [{src}] {m.get('ts')} {text[:100]}")
+
+
+def cmd_find(cfg: Config) -> int:
+    sc = SlackClient(cfg.slack_bot_token)
+    cursor = ""
+    total = 0
+    for _ in range(20):
+        res = sc._call("conversations.list", {"limit": "200", "types": "public_channel", "cursor": cursor}, post=False)
+        for ch in res.get("channels") or []:
+            total += 1
+            name = ch.get("name") or ""
+            if cfg.prefix in name or ch.get("is_archived"):
+                print(f"  #{name} id={ch.get('id')} archived={ch.get('is_archived')}")
+        cursor = (res.get("response_metadata") or {}).get("next_cursor") or ""
+        if not cursor:
+            break
+    print(f"total visible: {total}")
+    return 0
+
+
+def cmd_channel_op(cfg: Config, op: str, channel_id: str) -> int:
+    sc = SlackClient(cfg.slack_bot_token)
+    try:
+        if op == "archive":
+            sc.archive(channel_id)
+        else:
+            sc.unarchive(channel_id)
+        print(f"{op} {channel_id} OK")
+        return 0
+    except ApiError as e:
+        print(f"{op} {channel_id} FAILED: {e}")
+        return 1
+
+
+def cmd_config_dir(_: Config) -> int:
+    print(_default_config_dir())
+    return 0
+
+
+def cmd_state_dir(cfg: Config) -> int:
+    print(cfg.state_dir)
+    return 0
+
+
+USAGE = """omnigent-slack-bridge — per-agent Slack channels for Omnigent sessions
+
+Usage:
+  omnigent-slack-bridge poll          Run the bridge daemon (outbound + inbound).
+  omnigent-slack-bridge status        Print config + tracked sessions.
+  omnigent-slack-bridge auth          Probe Slack auth.test + Omnigent list.
+  omnigent-slack-bridge scopes        Probe which Slack scopes the token has.
+  omnigent-slack-bridge verify        Show recent messages in each channel.
+  omnigent-slack-bridge find          List channels matching the prefix.
+  omnigent-slack-bridge archive <id>  Archive a channel by id.
+  omnigent-slack-bridge unarchive <id>  Unarchive a channel by id.
+  omnigent-slack-bridge config-dir   Print the user config directory.
+  omnigent-slack-bridge state-dir     Print the state directory.
+
+Config (env file then environment):
+  ~/.config/omnigent-slack-bridge/config.env
+
+Required:
+  SLACK_BOT_TOKEN=xoxb-...
+  OMNIGENT_SLACK_BRIDGE_PREFIX=ck
+  (OMNIGENT_SERVER_URL + token are auto-read from ~/.omnigent by default)
+
+Optional:
+  SLACK_USER_ID=U...                   (pinged once on first blocked)
+  OMNIGENT_SLACK_BRIDGE_PRIVATE=true   (private channels)
+  OMNIGENT_SLACK_BRIDGE_POLL_INTERVAL=5
+  OMNIGENT_SLACK_BRIDGE_ALLOWED_USERS=U1,U2
+  OMNIGENT_SLACK_BRIDGE_PROJECT=<name> (scope to one Omnigent project)
+  OMNIGENT_AUTH_TOKEN=<jwt>            (override ~/.omnigent/auth_tokens.json)
+"""
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="omnigent-slack-bridge", add_help=False)
+    parser.add_argument("command")
+    parser.add_argument("rest", nargs="*")
+    args = parser.parse_args(argv)
+    cfg = load_config()
+    cmd = args.command
+    if cmd in ("-h", "--help", "help"):
+        print(USAGE)
+        return 0
+    if cmd == "poll":
+        return cmd_poll(cfg)
+    if cmd == "status":
+        return cmd_status(cfg)
+    if cmd == "auth":
+        return cmd_auth(cfg)
+    if cmd == "scopes":
+        return cmd_scopes(cfg)
+    if cmd == "verify":
+        return cmd_verify(cfg)
+    if cmd == "find":
+        return cmd_find(cfg)
+    if cmd in ("archive", "unarchive"):
+        if not args.rest:
+            print(f"usage: omnigent-slack-bridge {cmd} <channel-id>", file=sys.stderr)
+            return 2
+        return cmd_channel_op(cfg, cmd, args.rest[0])
+    if cmd == "config-dir":
+        return cmd_config_dir(cfg)
+    if cmd == "state-dir":
+        return cmd_state_dir(cfg)
+    print(f"unknown command: {cmd}\n", file=sys.stderr)
+    print(USAGE)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

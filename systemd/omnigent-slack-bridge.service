@@ -1,0 +1,15 @@
+[Unit]
+Description=Omnigent Slack Bridge — per-session Slack channels for Omnigent agents
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/omnigent-slack-bridge poll
+Restart=on-failure
+RestartSec=5
+# Config is read from %h/.config/omnigent-slack-bridge/config.env.
+# The Omnigent server URL + auth token are auto-read from ~/.omnigent.
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,30 @@
+{
+  "display_information": {
+    "name": "Omnigent Slack Bridge",
+    "description": "Posts Omnigent agent alerts to per-session channels and routes your Slack replies back into the session.",
+    "long_description": "A bridge that creates one Slack channel per Omnigent session, posts when an agent is blocked or a turn ends (mirroring the reply), and forwards your Slack replies back into the session as user messages via the Omnigent HTTP API."
+  },
+  "features": {
+    "bot_user": {
+      "display_name": "Omnigent Bridge",
+      "always_online": true
+    }
+  },
+  "oauth_config": {
+    "scopes": {
+      "bot": [
+        "chat:write",
+        "channels:manage",
+        "channels:history",
+        "channels:read",
+        "invites:write",
+        "groups:manage",
+        "groups:history",
+        "groups:read"
+      ]
+    }
+  },
+  "settings": {
+    "org_app_enabled": false
+  }
+}

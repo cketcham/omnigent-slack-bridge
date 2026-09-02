@@ -86,7 +86,7 @@ def _load_token_entry(server_url: str) -> dict[str, Any] | None:
         return None
 
 
-def _store_token(server_url: str, token: str, refresh_token: str, prev: dict[str, Any] | None) -> None:
+def _store_token(server_url: str, token: str, refresh_token: str, prev: dict[str, Any] | None, expires_in: int = 8 * 3600) -> None:
     """Persist a refreshed access token (and new refresh token) back to disk."""
     path = Path.home() / ".omnigent" / "auth_tokens.json"
     try:
@@ -100,11 +100,24 @@ def _store_token(server_url: str, token: str, refresh_token: str, prev: dict[str
     if refresh_token:
         entry["refresh_token"] = refresh_token
     import time as _t
-    entry["expires_at"] = _t.time() + (8 * 3600)
+    entry["expires_at"] = _t.time() + expires_in
     data[server_url] = entry
     tmp = str(path) + ".tmp"
     Path(tmp).write_text(json.dumps(data, indent=2))
     os.replace(tmp, str(path))
+
+
+def _load_login_credentials() -> tuple[str, str] | None:
+    """Read username + password from ~/.omnigent/login-credentials.
+    Returns (username, password) or None if the file is missing/malformed."""
+    path = Path.home() / ".omnigent" / "login-credentials"
+    try:
+        lines = path.read_text().strip().splitlines()
+        if len(lines) >= 2 and lines[0].strip() and lines[1].strip():
+            return lines[0].strip(), lines[1].strip()
+    except Exception:
+        pass
+    return None
 
 
 @dataclass
@@ -268,16 +281,43 @@ class OmnigentClient:
         return False
 
     def _refresh_via_server(self) -> bool:
-        """POST /oauth/token with the stored refresh_token. On success, persist
-        the new access+refresh tokens and return True."""
-        entry = _load_token_entry(self.cfg.server_url)
+        """Get a fresh access token. Two strategies:
+        1. If a refresh_token is stored, POST /oauth/token (no credentials needed).
+        2. Otherwise, re-login via /auth/login using ~/.omnigent/login-credentials.
+        On success, persist the new token and return True.
+        """
+        # Strategy 1: refresh token exchange.
+        entry = _load_token_entry(self.cfg.server_url) or {}
         rt = entry.get("refresh_token") if entry else ""
-        if not rt:
+        if rt:
+            body = urllib.parse.urlencode({"grant_type": "refresh_token", "refresh_token": rt}).encode()
+            url = self.base + "/oauth/token"
+            req = urllib.request.Request(url, data=body, method="POST")
+            req.add_header("Content-Type", "application/x-www-form-urlencoded")
+            try:
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    if resp.status != 200:
+                        return False
+                    out = json.loads(resp.read().decode())
+            except Exception:
+                return False
+            new_token = out.get("access_token") or out.get("token") or ""
+            new_refresh = out.get("refresh_token") or ""
+            if not new_token:
+                return False
+            self._token = new_token
+            _store_token(self.cfg.server_url, new_token, new_refresh, entry)
+            return True
+
+        # Strategy 2: re-login with stored credentials.
+        creds = _load_login_credentials()
+        if not creds:
             return False
-        body = urllib.parse.urlencode({"grant_type": "refresh_token", "refresh_token": rt}).encode()
-        url = self.base + "/oauth/token"
+        username, password = creds
+        body = json.dumps({"username": username, "password": password, "issue_refresh": True}).encode()
+        url = self.base + "/auth/login"
         req = urllib.request.Request(url, data=body, method="POST")
-        req.add_header("Content-Type", "application/x-www-form-urlencoded")
+        req.add_header("Content-Type", "application/json")
         try:
             with urllib.request.urlopen(req, timeout=15) as resp:
                 if resp.status != 200:
@@ -285,12 +325,14 @@ class OmnigentClient:
                 out = json.loads(resp.read().decode())
         except Exception:
             return False
-        new_token = out.get("access_token") or out.get("token") or ""
+        new_token = out.get("token") or ""
         new_refresh = out.get("refresh_token") or ""
         if not new_token:
             return False
         self._token = new_token
-        _store_token(self.cfg.server_url, new_token, new_refresh, entry)
+        expires_in = out.get("expires_in", 8 * 3600)
+        _store_token(self.cfg.server_url, new_token, new_refresh, entry, expires_in)
+        log(f"auth: re-logged in as {out.get('user', {}).get('id', '?')}; token valid {expires_in // 3600}h")
         return True
 
     def _headers(self) -> dict[str, str]:
@@ -840,8 +882,13 @@ class Bridge:
         channel_id = event.get("channel") or ""
         user = event.get("user") or ""
         text = (event.get("text") or "").strip()
+        bot_id = event.get("bot_id") or ""
+        subtype = event.get("subtype") or ""
+        log(f"inbound: msg channel={channel_id} user={user} bot_id={bot_id} sub={subtype} text={text[:50]!r}")
         if not text or not channel_id:
             return
+        if bot_id or subtype:
+            return  # skip bot messages and join/leave subtypes
         if not self._user_allowed(user):
             return
         # Look up the session for this channel.
@@ -921,13 +968,17 @@ class Bridge:
 
     async def _run_websocket(self) -> None:
         """Connect to /v1/sessions/updates and process changed frames in real-time.
-        Replaces the 5s polling loop — zero traffic when idle, instant on change."""
+        Replaces the 5s polling loop — zero traffic when idle, instant on change.
+        Also proactively refreshes the auth token before it expires."""
         import websockets
 
         # Initial watch-set: all my top-level sessions.
         sessions = self.omni.list_my_sessions()
         watched = [s["id"] for s in sessions]
         log(f"outbound: watching {len(watched)} sessions via websocket")
+
+        # Start a background task to proactively refresh the token.
+        asyncio.create_task(self._token_refresh_loop())
 
         headers = {"Authorization": f"Bearer {self.omni.token}"}
         async with websockets.connect(self._ws_url(), additional_headers=headers) as ws:
@@ -956,6 +1007,22 @@ class Bridge:
                         await ws.send(json.dumps({"type": "watch", "session_ids": watched}))
                         log(f"outbound: discovered {len(new_ids)} new session(s); now watching {len(watched)}")
                 # heartbeat / removed frames need no action.
+
+    async def _token_refresh_loop(self) -> None:
+        """Proactively refresh the auth token before it expires.
+        Checks every 5 minutes; re-logins when <1h of lifetime remains."""
+        while True:
+            await asyncio.sleep(300)  # check every 5 min
+            entry = _load_token_entry(self.cfg.server_url) or {}
+            expires_at = entry.get("expires_at", 0)
+            if not isinstance(expires_at, (int, float)):
+                continue
+            remaining = expires_at - time.time()
+            if remaining < 3600:  # <1h left
+                log(f"auth: token expires in {remaining/60:.0f}m; refreshing...")
+                ok = await asyncio.to_thread(self.omni._refresh_via_server)
+                if not ok:
+                    log("auth: proactive refresh failed; will retry in 5m")
 
     def run(self) -> None:
         mode = "socket-mode" if self.cfg.slack_app_token else "polling"

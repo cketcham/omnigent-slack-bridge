@@ -93,8 +93,18 @@ need to set them unless you want to override:
 | `OMNIGENT_SLACK_BRIDGE_POLL_INTERVAL` | `5` | Seconds between outbound ticks. |
 | `OMNIGENT_SLACK_BRIDGE_ALLOWED_USERS` | (any) | Comma list of Slack user ids allowed to reply. |
 | `OMNIGENT_SLACK_BRIDGE_PROJECT` | (none) | Scope to one Omnigent project; empty = all your sessions. |
+| `OMNIGENT_SLACK_BRIDGE_STATE_DIR` | `~/.local/share/omnigent-slack-bridge` | State file location. |
 
 ## 7. Install and run
+
+First, install the Python dependencies (the bridge uses `slack_sdk` for Socket
+Mode and `websockets` for the Omnigent session stream):
+
+```bash
+pip install slack_sdk websockets
+```
+
+Then install the bridge:
 
 ```bash
 # Install the binary + systemd unit

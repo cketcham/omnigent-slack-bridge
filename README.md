@@ -29,12 +29,14 @@ to the Omnigent HTTP API (Bearer JWT) and the Slack Web API (bot token).
         │     (forwarded as a user message)  │
 ```
 
-Channel names: `#<prefix>-<project>-<title-slug>` e.g.
-`#ck-git-parity-rejection-reply`. The channel name tracks the session title
-live (renamed when the title changes), so the channel stays recognizable as
-Omnigent auto-renames the session. If the name is already taken by another
-session, the session shortid is appended. Routing is by channel id stored in
-local state (keyed by session id).
+Channel names: `#<prefix>-<project>-<title-slug>` when the session is in a
+project, or `#<prefix>-<title-slug>` when it isn't — e.g.
+`#ck-git-parity-rejection-reply` or `#ck-omni-slack-bridge`. The channel
+name tracks the session title live (renamed via `conversations.rename` when
+the title changes), so the channel stays recognizable as Omnigent auto-renames
+the session. If the name is already taken by another session, the session
+shortid is appended. Routing is by channel id stored in local state (keyed by
+session id).
 
 ## Why this is easier than the Herdr version
 
@@ -86,6 +88,7 @@ subscriptions, tokens, troubleshooting). Short version:
 mkdir -p ~/.config/omnigent-slack-bridge
 cat > ~/.config/omnigent-slack-bridge/config.env <<'EOF'
 SLACK_BOT_TOKEN=xoxb-...
+SLACK_APP_TOKEN=xapp-...
 SLACK_USER_ID=U...
 OMNIGENT_SLACK_BRIDGE_PREFIX=ck
 # optional:
@@ -102,7 +105,12 @@ chmod 600 ~/.config/omnigent-slack-bridge/config.env
 ### 3. Install + run
 
 ```bash
+# Install Python dependencies
+pip install slack_sdk websockets
+
+# Install the binary + systemd unit
 scripts/install.sh
+
 omnigent-slack-bridge auth      # confirms Slack + Omnigent tokens
 omnigent-slack-bridge scopes    # probes which Slack scopes the token has
 omnigent-slack-bridge status    # prints config + tracked sessions
@@ -131,19 +139,45 @@ tmux new-session -d -s omnigent-slack-bridge -c ~ \
 ### 4. Verify
 
 Start an agent (`omnigent run …`). When it goes `waiting` you'll get a ping in a
-new `#ck-<agent>-<shortid>` channel. Reply there (top-level) and the text
-becomes a user message in the session. When the turn ends, the agent's reply is
-mirrored back into the same channel.
+new `#ck-<project>-<title>` channel (or `#ck-<title>` if the session has no
+project). Reply there (top-level) and the text becomes a user message in the
+session. When the turn ends, the agent's reply is mirrored back into the same
+channel.
+
+## Session lifecycle (archive / delete / unarchive)
+
+The bridge keeps the Slack channel in sync with the Omnigent session's
+lifecycle:
+
+| Omnigent action | Slack channel action |
+|---|---|
+| Archive session | Archives the channel |
+| Unarchive session | Unarchives the channel |
+| Delete session | Archives the channel |
+
+Slack does not allow bot tokens to delete channels (`admin.conversations.delete`
+requires Enterprise Grid + an admin user token), so a deleted Omnigent session
+archives the Slack channel rather than deleting it. The channel is hidden from
+the sidebar but preserved — it can be unarchived if the session ever returns.
+
+## Channel naming
+
+| Session has a project? | Channel name |
+|---|---|
+| Yes | `#<prefix>-<project>-<title>` e.g. `#ck-git-parity-bot-handling` |
+| No | `#<prefix>-<title>` e.g. `#ck-omni-slack-bridge` |
+| Name conflict | append the session shortid e.g. `#ck-omni-slack-bridge-09c9b1` |
+
+The channel name tracks the session title live — when Omnigent auto-renames a
+session, the bridge renames the Slack channel to match (and keeps the topic
+synced too).
 
 ## Agent renames
 
 If a session's `agent_name` changes (the agent was re-registered under a new
-name), the channel name would be stale. The bridge detects the change,
-archives the old channel, and creates a fresh one — the same proven approach
-the Herdr bridge uses (Slack's `conversations.rename` is admin-gated and
-flaky, so archive + recreate is more reliable). The channel **topic** is kept
-synced to the session `title`, so you can recognize a channel even as Omnigent
-auto-renames the session.
+name), the channel name would be stale. The bridge detects the change and
+renames the channel live via `conversations.rename`. The channel **topic** is
+kept synced to the session `title`.
 
 ## Config reference
 

@@ -40,7 +40,6 @@ from typing import Any
 # ──────────────────────────────────────────────────────────────────────────
 
 DEFAULT_PREFIX = "ck"
-DEFAULT_POLL_INTERVAL = 5  # seconds between ticks
 
 
 def _default_config_dir() -> str:
@@ -130,8 +129,6 @@ class Config:
     private: bool = False
     server_url: str = ""
     auth_token: str = ""
-    poll_interval: int = DEFAULT_POLL_INTERVAL
-    inbound_interval: int = 60  # seconds between inbound history polls
     allowed_users: list[str] = field(default_factory=list)
     state_dir: str = _default_state_dir()
     project: str = ""  # optional Omnigent project filter
@@ -140,6 +137,8 @@ class Config:
         missing = []
         if not self.slack_bot_token:
             missing.append("SLACK_BOT_TOKEN")
+        if not self.slack_app_token:
+            missing.append("SLACK_APP_TOKEN (Socket Mode — see SETUP.md)")
         if not self.prefix:
             missing.append("OMNIGENT_SLACK_BRIDGE_PREFIX")
         if not self.server_url:
@@ -190,24 +189,15 @@ def load_config() -> Config:
         private=_bool(get("OMNIGENT_SLACK_BRIDGE_PRIVATE")),
         server_url=server_url,
         auth_token=auth_token,
-        poll_interval=_int(get("OMNIGENT_SLACK_BRIDGE_POLL_INTERVAL"), DEFAULT_POLL_INTERVAL),
         allowed_users=_list(get("OMNIGENT_SLACK_BRIDGE_ALLOWED_USERS")),
         state_dir=get("OMNIGENT_SLACK_BRIDGE_STATE_DIR") or _default_state_dir(),
         project=get("OMNIGENT_SLACK_BRIDGE_PROJECT"),
-        inbound_interval=_int(get("OMNIGENT_SLACK_BRIDGE_INBOUND_INTERVAL"), 60),
     )
     return c
 
 
 def _bool(v: str) -> bool:
     return v.lower() in ("1", "true", "yes", "on")
-
-
-def _int(v: str, default: int) -> int:
-    try:
-        return int(v) if v.strip() else default
-    except ValueError:
-        return default
 
 
 def _list(v: str) -> list[str]:
@@ -449,14 +439,7 @@ class SlackClient:
         res = self._call("chat.postMessage", {"channel": channel_id, "text": text})
         return res.get("ts") or ""
 
-    def history(self, channel_id: str, oldest: str, limit: int = 50) -> list[dict[str, Any]]:
-        params = {"channel": channel_id, "limit": str(limit)}
-        if oldest:
-            params["oldest"] = oldest
-        res = self._call("conversations.history", params, post=False)
-        return res.get("messages") or []
-
-    def archive(self, channel_id: str) -> None:
+    def post_message(self, channel_id: str, text: str) -> str:
         try:
             self._call("conversations.archive", {"channel": channel_id})
         except ApiError as e:
@@ -905,55 +888,6 @@ class Bridge:
             return user != ""
         return user in self.cfg.allowed_users
 
-    # -- inbound fallback: polling (when socket mode unavailable) ------
-
-    def tick_inbound_polling(self) -> None:
-        """Fallback: poll conversations.history when Socket Mode isn't available."""
-        if SlackClient._rate_limit_until > time.monotonic():
-            return
-        for rec in self.store.records():
-            if rec.closed or not rec.channel_id:
-                continue
-            try:
-                self._poll_channel(rec)
-            except ApiError as e:
-                if e.err in ("channel_archived", "channel_not_found", "method_not_supported_for_channel_type"):
-                    self._set_field(rec.session_id, "closed", True)
-                elif e.err == "ratelimited":
-                    return
-                else:
-                    log(f"inbound: {rec.channel_name}: {e}")
-            except Exception as e:
-                log(f"inbound: {rec.channel_name}: {e}")
-
-    def _poll_channel(self, rec: SessionRecord) -> None:
-        msgs = self.slack.history(rec.channel_id, rec.last_seen_ts, limit=50)
-        newest = rec.last_seen_ts
-        for m in msgs:
-            ts = m.get("ts") or ""
-            if not _ts_greater(ts, rec.last_seen_ts):
-                continue
-            if m.get("bot_id") or m.get("subtype"):
-                if _ts_greater(ts, newest):
-                    newest = ts
-                continue
-            user = m.get("user") or ""
-            if not self._user_allowed(user):
-                if _ts_greater(ts, newest):
-                    newest = ts
-                continue
-            text = (m.get("text") or "").strip()
-            if not text:
-                continue
-            try:
-                self.omni.send_message(rec.session_id, text)
-            except ApiError as e:
-                log(f"inbound: forward to {rec.session_id}: {e}")
-            if _ts_greater(ts, newest):
-                newest = ts
-        if newest != rec.last_seen_ts:
-            self._set_field(rec.session_id, "last_seen_ts", newest)
-
     def _set_field(self, sid: str, key: str, value: Any) -> None:
         self.store.update(lambda sess: sess.setdefault(sid, {}).__setitem__(key, value))
 
@@ -1011,16 +945,16 @@ class Bridge:
                             watched.remove(sid)
 
     def run(self) -> None:
-        mode = "socket-mode" if self.cfg.slack_app_token else "polling"
-        log(f"omnigent-slack-bridge started; server={self.cfg.server_url} prefix={self.cfg.prefix} outbound=websocket inbound={mode}")
-        self._start_socket_mode()
-
-        # If Socket Mode isn't available, run a polling loop for both directions.
-        if not self._socket_mode:
-            self._run_polling_loop()
+        if not self.cfg.slack_app_token:
+            log("FATAL: SLACK_APP_TOKEN is required (Socket Mode for inbound).")
+            log("Create a Slack app with Socket Mode enabled — see SETUP.md.")
             return
-
-        # Socket Mode is handling inbound in its background thread.
+        log(f"omnigent-slack-bridge started; server={self.cfg.server_url} prefix={self.cfg.prefix} outbound=websocket inbound=socket-mode")
+        self._start_socket_mode()
+        if not self._socket_mode:
+            log("FATAL: Socket Mode failed to connect. Check SLACK_APP_TOKEN.")
+            return
+        # Socket Mode handles inbound in its background thread.
         # Run the Omnigent websocket in the main asyncio loop for outbound.
         while True:
             try:
@@ -1028,31 +962,6 @@ class Bridge:
             except Exception as e:
                 log(f"outbound: websocket error: {e}; reconnecting in 5s...")
                 time.sleep(5)
-
-    def _run_polling_loop(self) -> None:
-        """Fallback when Socket Mode isn't available: poll both Omnigent
-        sessions and Slack channel history."""
-        log("running in polling mode (no Socket Mode)")
-        last_inbound = 0.0
-        while True:
-            self.tick_outbound_polling()
-            if time.monotonic() - last_inbound >= self.cfg.inbound_interval:
-                self.tick_inbound_polling()
-                last_inbound = time.monotonic()
-            time.sleep(max(1, self.cfg.poll_interval))
-
-    def tick_outbound_polling(self) -> None:
-        """Fallback outbound: poll GET /v1/sessions instead of websocket."""
-        try:
-            sessions = self.omni.list_my_sessions()
-        except ApiError as e:
-            log(f"outbound: list sessions failed: {e}")
-            return
-        for s in sessions:
-            try:
-                self._handle_session(s)
-            except Exception as e:
-                log(f"outbound: session {s.get('id')}: {e}")
 
 
 def _ts_greater(a: str, b: str) -> bool:
@@ -1091,7 +1000,6 @@ def cmd_status(cfg: Config) -> int:
     print(f"server:     {cfg.server_url}")
     print(f"prefix:     {cfg.prefix}")
     print(f"private:    {cfg.private}")
-    print(f"poll:       {cfg.poll_interval}s")
     print(f"allowed:    {cfg.allowed_users or '(any non-bot user)'}")
     print(f"bot token:  {_mask(cfg.slack_bot_token)}")
     print(f"user id:     {cfg.slack_user_id or '(unset)'}")
@@ -1133,7 +1041,6 @@ def cmd_scopes(cfg: Config) -> int:
     probes = [
         ("conversations.list (channels:read)", "conversations.list", {"limit": "1", "types": "public_channel"}, False),
         ("conversations.create (channels:manage)", "conversations.create", {"name": "__omni_scope_probe__"}, True),
-        ("conversations.history (channels:history)", "conversations.history", {"channel": "__none__", "limit": "1"}, False),
         ("conversations.invite (invites:write)", "conversations.invite", {"channel": "__none__", "users": cfg.slack_user_id}, True),
         ("conversations.setTopic (channels:manage)", "conversations.setTopic", {"channel": "__none__", "topic": "x"}, True),
     ]
@@ -1164,14 +1071,11 @@ def cmd_verify(cfg: Config) -> int:
             print("  (no channel / closed)")
             continue
         try:
-            msgs = sc.history(r.channel_id, "", limit=10)
+            res = sc._call("conversations.info", {"channel": r.channel_id}, post=False)
+            ch = res.get("channel", {})
+            print(f"  slack: name=#{ch.get('name')} archived={ch.get('is_archived')} topic={ch.get('topic',{}).get('value','')[:50]}")
         except ApiError as e:
-            print(f"  history FAILED: {e}")
-            continue
-        for m in msgs:
-            src = "bot" if m.get("bot_id") else f"user:{m.get('user')}"
-            text = (m.get("text") or "").replace("\n", " / ")
-            print(f"  [{src}] {m.get('ts')} {text[:100]}")
+            print(f"  conversations.info FAILED: {e}")
 
 
 def cmd_find(cfg: Config) -> int:
@@ -1235,13 +1139,13 @@ Config (env file then environment):
 
 Required:
   SLACK_BOT_TOKEN=xoxb-...
+  SLACK_APP_TOKEN=xapp-...   (Socket Mode — see SETUP.md)
   OMNIGENT_SLACK_BRIDGE_PREFIX=ck
   (OMNIGENT_SERVER_URL + token are auto-read from ~/.omnigent by default)
 
 Optional:
   SLACK_USER_ID=U...                   (pinged once on first blocked)
   OMNIGENT_SLACK_BRIDGE_PRIVATE=true   (private channels)
-  OMNIGENT_SLACK_BRIDGE_POLL_INTERVAL=5
   OMNIGENT_SLACK_BRIDGE_ALLOWED_USERS=U1,U2
   OMNIGENT_SLACK_BRIDGE_PROJECT=<name> (scope to one Omnigent project)
   OMNIGENT_AUTH_TOKEN=<jwt>            (override ~/.omnigent/auth_tokens.json)

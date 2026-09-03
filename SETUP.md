@@ -22,8 +22,8 @@ app actually receives message events).
 ## 2. Enable Socket Mode
 
 Socket Mode lets the bridge receive messages via a persistent websocket instead
-of polling `conversations.history` (which is rate-limited). The manifest
-enables this automatically, but if you're configuring manually:
+of polling the Slack API. The manifest enables this automatically, but if you're
+configuring manually:
 
 1. In your app's left sidebar, click **Socket Mode** (under "Settings").
 2. Toggle it **ON**.
@@ -90,7 +90,6 @@ need to set them unless you want to override:
 | `OMNIGENT_SERVER_URL` | from `~/.omnigent/config.yaml` | Omnigent server URL. |
 | `OMNIGENT_AUTH_TOKEN` | from `~/.omnigent/auth_tokens.json` | Bearer JWT. |
 | `OMNIGENT_SLACK_BRIDGE_PRIVATE` | `false` | Create private channels. |
-| `OMNIGENT_SLACK_BRIDGE_POLL_INTERVAL` | `5` | Seconds between outbound ticks. |
 | `OMNIGENT_SLACK_BRIDGE_ALLOWED_USERS` | (any) | Comma list of Slack user ids allowed to reply. |
 | `OMNIGENT_SLACK_BRIDGE_PROJECT` | (none) | Scope to one Omnigent project; empty = all your sessions. |
 | `OMNIGENT_SLACK_BRIDGE_STATE_DIR` | `~/.local/share/omnigent-slack-bridge` | State file location. |
@@ -153,11 +152,9 @@ Go to **OAuth & Permissions** → **Bot Token Scopes** and add:
 
 - `chat:write` — post messages
 - `channels:manage` — create/rename/archive channels
-- `channels:history` — read channel history (fallback if no Socket Mode)
 - `channels:read` — list channels
 - `invites:write` — invite users to channels
 - `groups:manage` — create/rename private channels
-- `groups:history` — read private channel history
 - `groups:read` — list private channels
 
 ### Socket Mode
@@ -193,9 +190,9 @@ reinstalled after enabling them. Check:
 
 ### `ratelimited` errors in the log
 
-This means the bridge is polling `conversations.history` instead of using
-Socket Mode. Ensure `SLACK_APP_TOKEN` is set and Socket Mode is enabled in the
-app. The bridge logs `inbound=socket-mode` on startup if it's connected.
+This shouldn't happen with Socket Mode (no polling). If you see it, it's
+likely from channel creation or renaming during a burst of session changes. The
+bridge backs off automatically using Slack's `Retry-After` header.
 
 ### `auth_expired (run \`omnigent login\`)`
 

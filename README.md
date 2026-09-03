@@ -93,7 +93,6 @@ SLACK_USER_ID=U...
 OMNIGENT_SLACK_BRIDGE_PREFIX=ck
 # optional:
 # OMNIGENT_SLACK_BRIDGE_PRIVATE=true
-# OMNIGENT_SLACK_BRIDGE_POLL_INTERVAL=5
 # OMNIGENT_SLACK_BRIDGE_ALLOWED_USERS=U0123,U0456
 # OMNIGENT_SLACK_BRIDGE_PROJECT=<one Omnigent project name>
 # OMNIGENT_SERVER_URL=https://...   # overrides ~/.omnigent/config.yaml
@@ -189,7 +188,6 @@ kept synced to the session `title`.
 | `SLACK_USER_ID` | — | Your Slack user id; `@mentioned` once on the first blocked. |
 | `OMNIGENT_SERVER_URL` | from `~/.omnigent/config.yaml` | Omnigent server. |
 | `OMNIGENT_AUTH_TOKEN` | from `~/.omnigent/auth_tokens.json` | Bearer JWT. |
-| `OMNIGENT_SLACK_BRIDGE_POLL_INTERVAL` | `5` | Seconds between ticks. |
 | `OMNIGENT_SLACK_BRIDGE_PRIVATE` | `false` | Create private channels. |
 | `OMNIGENT_SLACK_BRIDGE_ALLOWED_USERS` | (any) | Comma list of Slack user ids allowed to reply. |
 | `OMNIGENT_SLACK_BRIDGE_PROJECT` | (none) | Scope to one Omnigent project; empty = all your sessions. |

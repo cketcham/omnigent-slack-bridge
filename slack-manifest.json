@@ -15,11 +15,9 @@
       "bot": [
         "chat:write",
         "channels:manage",
-        "channels:history",
         "channels:read",
         "invites:write",
         "groups:manage",
-        "groups:history",
         "groups:read"
       ]
     }

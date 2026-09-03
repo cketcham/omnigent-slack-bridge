@@ -86,7 +86,7 @@ need to set them unless you want to override:
 | `SLACK_BOT_TOKEN` | — | Bot OAuth token (`xoxb-...`). **Required.** |
 | `SLACK_APP_TOKEN` | — | App-Level token for Socket Mode (`xapp-...`). **Required** for real-time inbound. |
 | `SLACK_USER_ID` | — | Your Slack user id; `@mentioned` once on first blocked. |
-| `OMNIGENT_SLACK_BRIDGE_PREFIX` | `ck` | Channel-name prefix. |
+| `OMNIGENT_SLACK_BRIDGE_PREFIX` | — | Channel-name prefix (e.g. `ck`). **Required.** |
 | `OMNIGENT_SERVER_URL` | from `~/.omnigent/config.yaml` | Omnigent server URL. |
 | `OMNIGENT_AUTH_TOKEN` | from `~/.omnigent/auth_tokens.json` | Bearer JWT. |
 | `OMNIGENT_SLACK_BRIDGE_PRIVATE` | `false` | Create private channels. |

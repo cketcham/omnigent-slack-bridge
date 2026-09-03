@@ -185,7 +185,7 @@ def load_config() -> Config:
         slack_bot_token=get("SLACK_BOT_TOKEN"),
         slack_app_token=get("SLACK_APP_TOKEN"),
         slack_user_id=get("SLACK_USER_ID"),
-        prefix=get("OMNIGENT_SLACK_BRIDGE_PREFIX") or DEFAULT_PREFIX,
+        prefix=get("OMNIGENT_SLACK_BRIDGE_PREFIX"),
         private=_bool(get("OMNIGENT_SLACK_BRIDGE_PRIVATE")),
         server_url=server_url,
         auth_token=auth_token,
@@ -827,13 +827,13 @@ class Bridge:
             from slack_sdk.socket_mode.request import SocketModeRequest
             from slack_sdk.web import WebClient
         except ImportError:
-            log("inbound: slack_sdk not installed — falling back to polling")
+            log("inbound: slack_sdk not installed — install with: pip install slack_sdk")
             self._socket_mode = False
             return
 
         app_token = self.cfg.slack_app_token
         if not app_token:
-            log("inbound: no SLACK_APP_TOKEN — falling back to polling")
+            log("inbound: no SLACK_APP_TOKEN — see SETUP.md")
             self._socket_mode = False
             return
 

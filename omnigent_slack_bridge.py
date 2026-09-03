@@ -436,36 +436,44 @@ class SlackClient:
                 raise
 
     def post_message(self, channel_id: str, text: str) -> str:
-        res = self._call("chat.postMessage", {"channel": channel_id, "text": text})
-        return res.get("ts") or ""
+        try:
+            res = self._call("chat.postMessage", {"channel": channel_id, "text": text})
+            return res.get("ts") or ""
+        except ApiError as e:
+            if e.err in ("not_in_channel", "channel_not_found"):
+                return ""
+            raise
 
-    def post_message(self, channel_id: str, text: str) -> str:
+    def archive(self, channel_id: str) -> None:
         try:
             self._call("conversations.archive", {"channel": channel_id})
         except ApiError as e:
-            if e.err != "already_archived":
+            if e.err not in ("already_archived", "not_in_channel", "channel_not_found"):
                 raise
 
     def unarchive(self, channel_id: str) -> None:
         try:
             self._call("conversations.unarchive", {"channel": channel_id})
         except ApiError as e:
-            if e.err != "not_archived":
+            if e.err not in ("not_archived", "not_in_channel", "channel_not_found"):
                 raise
 
     def set_topic(self, channel_id: str, topic: str) -> None:
         try:
             self._call("conversations.setTopic", {"channel": channel_id, "topic": topic[:1024]})
         except ApiError:
-            pass  # best-effort; some scopes/workspaces restrict this
+            pass  # best-effort; not_in_channel, scope loss, etc.
 
     def rename(self, channel_id: str, name: str) -> bool:
         """Rename a channel. Returns True on success. Best-effort: a failure
-        (e.g. scope loss) is logged by the caller but never fatal."""
+        (e.g. scope loss, not in channel) is logged but never fatal."""
         try:
             self._call("conversations.rename", {"channel": channel_id, "name": name})
             return True
         except ApiError as e:
+            if e.err in ("not_in_channel", "channel_not_found"):
+                log(f"slack.rename {channel_id}: channel gone, marking closed")
+                return False
             log(f"slack.rename {channel_id}: {e.err}")
             return False
 

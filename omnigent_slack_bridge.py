@@ -640,8 +640,9 @@ class Bridge:
         self._socket_mode = False
 
     def _project_name(self, s: dict[str, Any]) -> str:
-        """Resolve a session's project to a human name, falling back to the
-        workspace basename (the repo dir) when it has no project."""
+        """Resolve a session's project to a human name. Returns empty string
+        when the session has no project — the channel name then uses just
+        prefix + title (e.g. #ck-omni-slack-bridge)."""
         pid = s.get("project_id") or ""
         if pid:
             if self._projects is None:
@@ -649,13 +650,7 @@ class Bridge:
                     self._projects = self.omni.list_projects()
                 except ApiError:
                     self._projects = {}
-            name = self._projects.get(pid, "")
-            if name:
-                return name
-        # No project (or unresolvable): use the workspace dir basename.
-        ws = s.get("workspace") or ""
-        if ws:
-            return ws.rstrip("/").split("/")[-1]
+            return self._projects.get(pid, "")
         return ""
 
     # -- outbound: watch sessions, alert + mirror ---------------------

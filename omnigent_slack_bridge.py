@@ -12,9 +12,11 @@ Channel names: ``#<prefix>-<project>-<title-slug>`` e.g. ``#ck-git-parity-reject
 The channel name tracks the session title live (renamed when the title changes),
 so the channel stays recognizable as Omnigent auto-renames the session.
 
-Pure stdlib (urllib + json) so there is nothing to pip install. Talks to the
-Omnigent HTTP API (Bearer JWT from ``~/.omnigent/auth_tokens.json``) and the
-Slack Web API (bot token). No plugin hooks, no socket paths, no tmux.
+Uses ``slack_sdk`` for Slack Socket Mode (real-time inbound) and
+``websockets`` for the Omnigent session-update stream (real-time outbound).
+Talks to the Omnigent HTTP API (Bearer JWT from
+``~/.omnigent/auth_tokens.json``) and the Slack Web API (bot token). No
+plugin hooks, no socket paths, no transcript-file parsing.
 """
 
 from __future__ import annotations
@@ -99,8 +101,7 @@ def _store_token(server_url: str, token: str, refresh_token: str, prev: dict[str
     entry["token"] = token
     if refresh_token:
         entry["refresh_token"] = refresh_token
-    import time as _t
-    entry["expires_at"] = _t.time() + expires_in
+    entry["expires_at"] = time.time() + expires_in
     data[server_url] = entry
     tmp = str(path) + ".tmp"
     Path(tmp).write_text(json.dumps(data, indent=2))
@@ -211,13 +212,6 @@ def _int(v: str, default: int) -> int:
 
 def _list(v: str) -> list[str]:
     return [p.strip() for p in v.split(",") if p.strip()]
-
-
-def _first_nonempty(*vals: str) -> str:
-    for v in vals:
-        if v:
-            return v
-    return ""
 
 
 def _mask(t: str) -> str:
@@ -570,6 +564,8 @@ class StateStore:
     def __init__(self, dirpath: str):
         self.path = os.path.join(dirpath, "state.json")
         os.makedirs(dirpath, exist_ok=True)
+        import threading
+        self._lock = threading.Lock()
 
     def _load(self) -> dict[str, Any]:
         try:
@@ -585,10 +581,12 @@ class StateStore:
         os.replace(tmp, self.path)
 
     def update(self, fn) -> None:
-        data = self._load()
-        sessions: dict[str, Any] = data.setdefault("sessions", {})
-        fn(sessions)
-        self._save(data)
+        import threading
+        with self._lock:
+            data = self._load()
+            sessions: dict[str, Any] = data.setdefault("sessions", {})
+            fn(sessions)
+            self._save(data)
 
     def records(self) -> list[SessionRecord]:
         data = self._load()
@@ -638,6 +636,7 @@ class Bridge:
         self.store = StateStore(cfg.state_dir)
         self._projects: dict[str, str] | None = None  # project_id -> name cache
         self._socket_mode = False
+        self._seen_inbound_ts: set[str] = set()  # dedup inbound Slack messages
 
     def _project_name(self, s: dict[str, Any]) -> str:
         """Resolve a session's project to a human name. Returns empty string
@@ -653,20 +652,6 @@ class Bridge:
             return self._projects.get(pid, "")
         return ""
 
-    # -- outbound: watch sessions, alert + mirror ---------------------
-
-    def tick_outbound(self) -> None:
-        try:
-            sessions = self.omni.list_my_sessions()
-        except ApiError as e:
-            log(f"outbound: list sessions failed: {e}")
-            return
-        for s in sessions:
-            try:
-                self._handle_session(s)
-            except Exception as e:
-                log(f"outbound: session {s.get('id')}: {e}")
-
     def _handle_session(self, s: dict[str, Any]) -> None:
         sid = s.get("id") or ""
         if not sid:
@@ -679,7 +664,7 @@ class Bridge:
         blocked = status == "waiting" or pending > 0
 
         def write(sessions: dict[str, Any]) -> None:
-            self._mutate(sessions, sid, project, title, status, archived, blocked, s)
+            self._mutate(sessions, sid, project, title, status, archived, blocked)
 
         self.store.update(write)
 
@@ -695,7 +680,7 @@ class Bridge:
                 log(f"outbound: session {sid[:12]} deleted; archived #{rec.channel_name}")
         self.store.update(write)
 
-    def _mutate(self, sessions, sid, project, title, status, archived, blocked, s_raw) -> None:
+    def _mutate(self, sessions, sid, project, title, status, archived, blocked) -> None:
         rec = self.store.get(sessions, sid)
         if rec.created_at == 0:
             sessions[sid]["created_at"] = int(time.time())
@@ -721,10 +706,9 @@ class Bridge:
         # recognizable as Omnigent auto-renames the session.
         want_name = channel_name(self.cfg.prefix, project, title)
 
-        # Project change while a channel exists: rename it to the new project.
+        # Log project changes for visibility; the rename happens below.
         if rec.channel_id and rec.project and rec.project != project:
             log(f"project changed: {rec.project} -> {project}; renaming channel")
-            sessions[sid]["project"] = project
 
         sessions[sid]["project"] = project
         sessions[sid]["title"] = title
@@ -887,14 +871,24 @@ class Bridge:
         log("inbound: socket mode connected (real-time message push)")
 
     def _handle_inbound_message(self, event: dict[str, Any]) -> None:
-        """Forward a Slack user message to the matching Omnigent session."""
+        """Forward a Slack user message to the matching Omnigent session.
+        Deduplicates by message ts — Slack may retry Socket Mode events."""
         channel_id = event.get("channel") or ""
         user = event.get("user") or ""
         text = (event.get("text") or "").strip()
+        ts = event.get("ts") or ""
         if not text or not channel_id:
             return
         if not self._user_allowed(user):
             return
+        # Dedup: skip if we already forwarded this exact ts.
+        if ts and ts in self._seen_inbound_ts:
+            return
+        if ts:
+            self._seen_inbound_ts.add(ts)
+            # Keep the dedup set bounded.
+            if len(self._seen_inbound_ts) > 500:
+                self._seen_inbound_ts = set(list(self._seen_inbound_ts)[-250:])
         # Look up the session for this channel.
         for rec in self.store.records():
             if rec.channel_id == channel_id and not rec.closed:
@@ -1021,15 +1015,44 @@ class Bridge:
         log(f"omnigent-slack-bridge started; server={self.cfg.server_url} prefix={self.cfg.prefix} outbound=websocket inbound={mode}")
         self._start_socket_mode()
 
-        # Run the Omnigent websocket in the main thread (asyncio loop).
-        # Slack Socket Mode runs in its own background thread.
-        import asyncio
+        # If Socket Mode isn't available, run a polling loop for both directions.
+        if not self._socket_mode:
+            self._run_polling_loop()
+            return
+
+        # Socket Mode is handling inbound in its background thread.
+        # Run the Omnigent websocket in the main asyncio loop for outbound.
         while True:
             try:
                 asyncio.run(self._run_websocket())
             except Exception as e:
                 log(f"outbound: websocket error: {e}; reconnecting in 5s...")
                 time.sleep(5)
+
+    def _run_polling_loop(self) -> None:
+        """Fallback when Socket Mode isn't available: poll both Omnigent
+        sessions and Slack channel history."""
+        log("running in polling mode (no Socket Mode)")
+        last_inbound = 0.0
+        while True:
+            self.tick_outbound_polling()
+            if time.monotonic() - last_inbound >= self.cfg.inbound_interval:
+                self.tick_inbound_polling()
+                last_inbound = time.monotonic()
+            time.sleep(max(1, self.cfg.poll_interval))
+
+    def tick_outbound_polling(self) -> None:
+        """Fallback outbound: poll GET /v1/sessions instead of websocket."""
+        try:
+            sessions = self.omni.list_my_sessions()
+        except ApiError as e:
+            log(f"outbound: list sessions failed: {e}")
+            return
+        for s in sessions:
+            try:
+                self._handle_session(s)
+            except Exception as e:
+                log(f"outbound: session {s.get('id')}: {e}")
 
 
 def _ts_greater(a: str, b: str) -> bool:
@@ -1119,7 +1142,13 @@ def cmd_scopes(cfg: Config) -> int:
             sc._call(method, params, post=post)
             print(f"{name:45s} OK")
         except ApiError as e:
-            print(f"{name:45s} {e.err}")
+            # For create/invite, a scope-missing error is 'missing_scope';
+            # a validation error (e.g. name_taken, channel_not_found) means
+            # the scope IS present — the call just had a bad arg.
+            if e.err in ("name_taken", "channel_not_found", "already_in_channel"):
+                print(f"{name:45s} OK (scope present)")
+            else:
+                print(f"{name:45s} {e.err}")
     return 0
 
 
@@ -1154,7 +1183,7 @@ def cmd_find(cfg: Config) -> int:
         for ch in res.get("channels") or []:
             total += 1
             name = ch.get("name") or ""
-            if cfg.prefix in name or ch.get("is_archived"):
+            if name.startswith(cfg.prefix + "-") or ch.get("is_archived"):
                 print(f"  #{name} id={ch.get('id')} archived={ch.get('is_archived')}")
         cursor = (res.get("response_metadata") or {}).get("next_cursor") or ""
         if not cursor:

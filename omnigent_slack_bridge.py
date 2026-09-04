@@ -691,6 +691,13 @@ class Bridge:
                 sessions[sid]["closed"] = False
                 self.slack.post_message(rec.channel_id, "📦 session unarchived; channel reopened.")
 
+        # Skip all channel operations for sessions whose channel is already closed
+        # (deleted/archived/gone). The session may still appear in snapshots but
+        # its Slack channel is gone — don't try to rename, create, or post to it.
+        if rec.closed:
+            sessions[sid]["last_status"] = status
+            return
+
         # The channel name tracks the current project + title, so a title
         # change renames the channel live (Slack supports conversations.rename).
         # A project change (rare) also renames. This keeps the channel name
@@ -709,6 +716,12 @@ class Bridge:
             if self.slack.rename(rec.channel_id, want_name):
                 sessions[sid]["channel_name"] = want_name
                 rec = self.store.get(sessions, sid)
+            else:
+                # Rename failed (channel gone/archived) — mark closed so we
+                # stop retrying on every tick.
+                sessions[sid]["closed"] = True
+                log(f"outbound: channel gone for {sid[:12]}; marking closed")
+                return
 
         # Keep the channel topic synced to the session title too.
         if rec.channel_id and title and rec.title != title:
@@ -935,14 +948,29 @@ class Bridge:
                 if ftype in ("snapshot", "changed"):
                     items = frame.get("items", [])
                     # Process each changed session in a thread (sync REST/Slack calls).
+                    # Catch per-session errors so one bad session doesn't crash the
+                    # websocket and prevent snapshot-based removal detection.
                     for item in items:
-                        await asyncio.to_thread(self._handle_session, item)
+                        try:
+                            await asyncio.to_thread(self._handle_session, item)
+                        except Exception as e:
+                            log(f"outbound: session {item.get('id','')[:12]}: {e}")
                     # Discover new session ids not in our watch-set; re-watch.
                     new_ids = [it["id"] for it in items if it.get("id") and it["id"] not in watched]
                     if new_ids:
                         watched.extend(new_ids)
                         await ws.send(json.dumps({"type": "watch", "session_ids": watched}))
                         log(f"outbound: discovered {len(new_ids)} new session(s); now watching {len(watched)}")
+                    # On a full snapshot (reconnect), detect sessions that were
+                    # deleted while we were disconnected: any session in our
+                    # state with an open channel that's NOT in the snapshot.
+                    if ftype == "snapshot":
+                        snapshot_ids = {it.get("id") for it in items if it.get("id")}
+                        for rec in self.store.records():
+                            if rec.channel_id and not rec.closed and rec.session_id not in snapshot_ids:
+                                await asyncio.to_thread(self._handle_session_removed, rec.session_id)
+                                if rec.session_id in watched:
+                                    watched.remove(rec.session_id)
                 elif ftype == "removed":
                     # Session was deleted — archive its Slack channel (Slack
                     # doesn't allow bot tokens to delete channels, only archive).

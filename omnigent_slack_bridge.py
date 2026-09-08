@@ -671,6 +671,17 @@ class Bridge:
                 log(f"outbound: session {sid[:12]} deleted; archived #{rec.channel_name}")
         self.store.update(write)
 
+    def _retry_archive(self, sid: str) -> None:
+        """Retry archiving a channel for a session that's marked closed in
+        state but whose Slack channel is still open (a previous archive
+        call failed, e.g. during a rate-limit crash loop)."""
+        def write(sessions: dict[str, Any]) -> None:
+            rec = self.store.get(sessions, sid)
+            if rec.channel_id:
+                self.slack.archive(rec.channel_id)
+                log(f"outbound: retried archive for {sid[:12]} (#{rec.channel_name})")
+        self.store.update(write)
+
     def _mutate(self, sessions, sid, project, title, status, archived, blocked) -> None:
         rec = self.store.get(sessions, sid)
         if rec.created_at == 0:
@@ -967,10 +978,19 @@ class Bridge:
                     if ftype == "snapshot":
                         snapshot_ids = {it.get("id") for it in items if it.get("id")}
                         for rec in self.store.records():
-                            if rec.channel_id and not rec.closed and rec.session_id not in snapshot_ids:
+                            if not rec.channel_id:
+                                continue
+                            # Session not in snapshot = deleted while we were
+                            # disconnected. Archive its channel.
+                            if not rec.closed and rec.session_id not in snapshot_ids:
                                 await asyncio.to_thread(self._handle_session_removed, rec.session_id)
                                 if rec.session_id in watched:
                                     watched.remove(rec.session_id)
+                            # Session marked closed in state but channel still
+                            # open in Slack = a previous archive failed (e.g.
+                            # rate limit during a crash loop). Retry the archive.
+                            elif rec.closed and rec.session_id not in snapshot_ids:
+                                await asyncio.to_thread(self._retry_archive, rec.session_id)
                 elif ftype == "removed":
                     # Session was deleted — archive its Slack channel (Slack
                     # doesn't allow bot tokens to delete channels, only archive).

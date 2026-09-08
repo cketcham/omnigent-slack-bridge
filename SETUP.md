@@ -63,7 +63,7 @@ needs your Slack user id:
 
 1. In Slack, click your profile picture → **Profile**.
 2. Click the **⋯** (three dots) menu → **Copy member ID**.
-3. The id looks like `U0B4NDR0B5Z`. This is your `SLACK_USER_ID`.
+3. The id looks like `U123ABC4DEF`. This is your `SLACK_USER_ID`.
 
 ## 6. Write the config
 

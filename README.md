@@ -10,10 +10,11 @@ from your phone.
 - You reply **top-level** in the channel (no threads) and the text is forwarded
   into the session as a user message via `POST /v1/sessions/{id}/events`.
 
-This is the Omnigent counterpart to
-[`herdr-slack-bridge`](../herdr-slack-bridge), and it's **simpler**: no plugin
-hooks, no socket paths, no tmux, no transcript-file parsing. One daemon talks
-to the Omnigent HTTP API (Bearer JWT) and the Slack Web API (bot token).
+This is the successor to
+[`herdr-slack-bridge`](https://github.com/cketcham/herdr-slack-bridge)
+(now deprecated), and it's **simpler**: no plugin hooks, no socket paths, no
+tmux, no transcript-file parsing. One daemon talks to the Omnigent HTTP API
+(Bearer JWT) and the Slack Web API (bot token).
 
 ```
    Omnigent server                         Slack

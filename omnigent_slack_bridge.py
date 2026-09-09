@@ -702,12 +702,13 @@ class Bridge:
                 sessions[sid]["closed"] = False
                 self.slack.post_message(rec.channel_id, "📦 session unarchived; channel reopened.")
 
-        # Skip all channel operations for sessions whose channel is already closed
-        # (deleted/archived/gone). The session may still appear in snapshots but
-        # its Slack channel is gone — don't try to rename, create, or post to it.
-        if rec.closed:
-            sessions[sid]["last_status"] = status
-            return
+        # If the channel is closed but the session is still active (not archived),
+        # the channel was lost (archived externally, bot removed, etc.). Reset
+        # channel_id so a fresh channel is created below.
+        if rec.closed and not archived:
+            sessions[sid]["channel_id"] = ""
+            rec = self.store.get(sessions, sid)
+            log(f"outbound: channel lost for active session {sid[:12]}; will recreate")
 
         # The channel name tracks the current project + title, so a title
         # change renames the channel live (Slack supports conversations.rename).
@@ -728,11 +729,12 @@ class Bridge:
                 sessions[sid]["channel_name"] = want_name
                 rec = self.store.get(sessions, sid)
             else:
-                # Rename failed (channel gone/archived) — mark closed so we
-                # stop retrying on every tick.
+                # Rename failed (channel gone/archived) — reset channel_id so
+                # a fresh channel is created below.
+                sessions[sid]["channel_id"] = ""
                 sessions[sid]["closed"] = True
-                log(f"outbound: channel gone for {sid[:12]}; marking closed")
-                return
+                log(f"outbound: channel gone for {sid[:12]}; will recreate")
+                rec = self.store.get(sessions, sid)
 
         # Keep the channel topic synced to the session title too.
         if rec.channel_id and title and rec.title != title:
@@ -744,11 +746,14 @@ class Bridge:
             sessions[sid]["last_status"] = status
             return  # running / unknown — nothing to say
 
-        # Lazily create the channel on the first actionable event.
-        if not rec.channel_id:
+        # Lazily create the channel on the first actionable event, OR recreate
+        # if the channel was lost (archived externally / bot removed).
+        if not rec.channel_id or rec.closed:
             cid, cname = self._create_channel(want_name, project, title, sid)
             sessions[sid]["channel_id"] = cid
             sessions[sid]["channel_name"] = cname
+            sessions[sid]["closed"] = False
+            sessions[sid]["mentioned"] = False
             self.slack.invite_user(cid, self.cfg.slack_user_id)
             label = title or project or "session"
             intro = f"🚀 Channel for *{label}* (`{sid[:8]}`)."
@@ -798,12 +803,15 @@ class Bridge:
             return self.slack.create_channel(name, self.cfg.private), name
         except ApiError as e:
             if e.err == "name_taken":
-                cid = self.slack.lookup_by_name(name, self.cfg.private)
-                if cid:
-                    self.slack.unarchive(cid)
-                    return cid, name
-                # Name taken by another session's channel: fall back to the
-                # shortid-suffixed name so this session still gets its own.
+                # Try to find and unarchive the existing channel.
+                try:
+                    cid = self.slack.lookup_by_name(name, self.cfg.private)
+                    if cid:
+                        self.slack.unarchive(cid)
+                        return cid, name
+                except ApiError:
+                    pass  # lookup failed (rate limit, etc.) — fall through
+                # Name taken and lookup failed: use the shortid-suffixed name.
                 fb = conflict_name(self.cfg.prefix, project, title, sid)
                 return self.slack.create_channel(fb, self.cfg.private), fb
             raise

@@ -464,24 +464,38 @@ class SlackClient:
         except ApiError:
             pass  # best-effort; not_in_channel, scope loss, etc.
 
-    def rename(self, channel_id: str, name: str) -> bool:
-        """Rename a channel. Returns True on success. Best-effort: a failure
-        (e.g. scope loss, not in channel) is logged but never fatal."""
+    def rename(self, channel_id: str, name: str) -> str:
+        """Rename a channel. Returns 'ok' | 'taken' | 'gone'.
+        - 'ok': renamed successfully
+        - 'taken': the target name is held by another channel (not fatal —
+          the channel itself is fine, it just keeps its current name)
+        - 'gone': this channel no longer exists / bot isn't a member"""
         try:
             self._call("conversations.rename", {"channel": channel_id, "name": name})
-            return True
+            return "ok"
         except ApiError as e:
             if e.err in ("not_in_channel", "channel_not_found"):
-                log(f"slack.rename {channel_id}: channel gone, marking closed")
-                return False
+                log(f"slack.rename {channel_id}: channel gone")
+                return "gone"
+            if e.err == "name_taken":
+                log(f"slack.rename {channel_id}: name {name!r} taken; keeping current name")
+                return "taken"
             log(f"slack.rename {channel_id}: {e.err}")
-            return False
+            return "ok"  # unknown error — assume non-fatal, keep the channel
 
     def lookup_by_name(self, name: str, private: bool) -> str:
+        """Find a channel id by name. In large workspaces (20k+ channels)
+        pagination is rate-limited to uselessness — so bail out on the FIRST
+        rate limit and let the caller fall back to a suffixed name."""
         types = "private_channel" if private else "public_channel"
         cursor = ""
-        for _ in range(20):
-            res = self._call("conversations.list", {"limit": "200", "types": types, "cursor": cursor}, post=False)
+        for _ in range(5):  # bounded: at most 5 pages (~1000 channels)
+            try:
+                res = self._call("conversations.list", {"limit": "200", "types": types, "cursor": cursor}, post=False)
+            except ApiError as e:
+                if e.err == "ratelimited":
+                    return ""  # give up immediately — too costly in big workspaces
+                raise
             for ch in res.get("channels") or []:
                 if (ch.get("name") or "").lower() == name.lower():
                     return ch.get("id") or ""
@@ -703,12 +717,45 @@ class Bridge:
                 self.slack.post_message(rec.channel_id, "📦 session unarchived; channel reopened.")
 
         # If the channel is closed but the session is still active (not archived),
-        # the channel was lost (archived externally, bot removed, etc.). Reset
-        # channel_id so a fresh channel is created below.
+        # the channel was lost (archived externally, bot removed, etc.). Create
+        # a fresh channel right away — don't wait for an actionable event,
+        # since a long-running session may never produce one.
         if rec.closed and not archived:
-            sessions[sid]["channel_id"] = ""
+            want_name = channel_name(self.cfg.prefix, project, title)
+            try:
+                cid, cname = self._create_channel(want_name, project, title, sid)
+            except ApiError as e:
+                log(f"recreate channel for {sid[:12]}: {e}; will retry next event")
+                sessions[sid]["last_status"] = status
+                return
+            log(f"outbound: recreated channel for {sid[:12]} -> #{cname}")
+            sessions[sid]["channel_id"] = cid
+            sessions[sid]["channel_name"] = cname
+            sessions[sid]["closed"] = False
+            sessions[sid]["mentioned"] = False
+            try:
+                self.slack.invite_user(cid, self.cfg.slack_user_id)
+            except ApiError as e:
+                log(f"invite {cid} (non-fatal): {e.err}")
+            try:
+                label = title or project or "session"
+                intro = f"\U0001f680 Channel for *{label}* (`{sid[:8]}`)."
+                if project:
+                    intro += f"\nProject: *{project}*"
+                self.slack.post_message(cid, intro)
+            except ApiError as e:
+                log(f"intro post {cid} (non-fatal): {e.err}")
+            try:
+                self.slack.set_topic(cid, title or project)
+            except ApiError:
+                pass
+            try:
+                latest = self.omni.list_items(sid, limit=1, order="desc")
+                if latest:
+                    sessions[sid]["last_mirror_id"] = latest[0].get("id", "")
+            except ApiError as e:
+                log(f"seed last_mirror_id {sid} (non-fatal): {e}")
             rec = self.store.get(sessions, sid)
-            log(f"outbound: channel lost for active session {sid[:12]}; will recreate")
 
         # The channel name tracks the current project + title, so a title
         # change renames the channel live (Slack supports conversations.rename).
@@ -725,16 +772,18 @@ class Bridge:
 
         # Rename the channel when the desired name diverges from the current one.
         if rec.channel_id and rec.channel_name and rec.channel_name != want_name:
-            if self.slack.rename(rec.channel_id, want_name):
+            result = self.slack.rename(rec.channel_id, want_name)
+            if result == "ok":
                 sessions[sid]["channel_name"] = want_name
                 rec = self.store.get(sessions, sid)
-            else:
-                # Rename failed (channel gone/archived) — reset channel_id so
-                # a fresh channel is created below.
+            elif result == "gone":
+                # Channel no longer exists — reset so a fresh one is created below.
                 sessions[sid]["channel_id"] = ""
                 sessions[sid]["closed"] = True
                 log(f"outbound: channel gone for {sid[:12]}; will recreate")
                 rec = self.store.get(sessions, sid)
+            # 'taken' (name held by another channel): keep the current channel
+            # and name — not an error, don't recreate.
 
         # Keep the channel topic synced to the session title too.
         if rec.channel_id and title and rec.title != title:
@@ -750,25 +799,38 @@ class Bridge:
         # if the channel was lost (archived externally / bot removed).
         if not rec.channel_id or rec.closed:
             cid, cname = self._create_channel(want_name, project, title, sid)
+            # Persist the channel id IMMEDIATELY so a later failure (invite,
+            # post, rate limit) can't orphan the channel from state.
             sessions[sid]["channel_id"] = cid
             sessions[sid]["channel_name"] = cname
             sessions[sid]["closed"] = False
             sessions[sid]["mentioned"] = False
-            self.slack.invite_user(cid, self.cfg.slack_user_id)
-            label = title or project or "session"
-            intro = f"🚀 Channel for *{label}* (`{sid[:8]}`)."
-            if project:
-                intro += f"\nProject: *{project}*"
-            self.slack.post_message(cid, intro)
-            self.slack.set_topic(cid, title or project)
-            # Seed last_mirror_id to the newest item so we only mirror turns
-            # that happen AFTER the channel exists (no history dump).
+            # Everything below is best-effort — wrap each step so an error
+            # never aborts the state save (which would orphan the channel).
             try:
+                self.slack.invite_user(cid, self.cfg.slack_user_id)
+            except ApiError as e:
+                log(f"invite {cid} (non-fatal): {e.err}")
+            try:
+                label = title or project or "session"
+                intro = f"🚀 Channel for *{label}* (`{sid[:8]}`)."
+                if project:
+                    intro += f"\nProject: *{project}*"
+                self.slack.post_message(cid, intro)
+            except ApiError as e:
+                log(f"intro post {cid} (non-fatal): {e.err}")
+            try:
+                self.slack.set_topic(cid, title or project)
+            except ApiError:
+                pass
+            try:
+                # Seed last_mirror_id to the newest item so we only mirror turns
+                # that happen AFTER the channel exists (no history dump).
                 latest = self.omni.list_items(sid, limit=1, order="desc")
                 if latest:
                     sessions[sid]["last_mirror_id"] = latest[0].get("id", "")
             except ApiError as e:
-                log(f"seed last_mirror_id {sid}: {e}")
+                log(f"seed last_mirror_id {sid} (non-fatal): {e}")
 
         cid = sessions[sid]["channel_id"]
 
@@ -778,9 +840,12 @@ class Bridge:
             text = self._alert_text(title, project, sid, status, mention)
             if mention:
                 sessions[sid]["mentioned"] = True
-            ts = self.slack.post_message(cid, text)
-            if _ts_greater(ts, rec.last_seen_ts):
-                sessions[sid]["last_seen_ts"] = ts
+            try:
+                ts = self.slack.post_message(cid, text)
+                if _ts_greater(ts, rec.last_seen_ts):
+                    sessions[sid]["last_seen_ts"] = ts
+            except ApiError as e:
+                log(f"alert post {cid} (non-fatal): {e.err}")
             sessions[sid]["last_status"] = status
             return
 
@@ -788,22 +853,24 @@ class Bridge:
         if is_turn_end and rec.last_status != "idle":
             new_text, new_last_id = self._new_assistant_text(sid, rec.last_mirror_id)
             if new_text.strip():
-                mts = self.slack.post_message(cid, new_text)
-                sessions[sid]["last_mirror_id"] = new_last_id
-                if _ts_greater(mts, rec.last_seen_ts):
-                    sessions[sid]["last_seen_ts"] = mts
-            else:
-                sessions[sid]["last_mirror_id"] = new_last_id or rec.last_mirror_id
+                try:
+                    mts = self.slack.post_message(cid, new_text)
+                    if _ts_greater(mts, rec.last_seen_ts):
+                        sessions[sid]["last_seen_ts"] = mts
+                except ApiError as e:
+                    log(f"mirror post {cid} (non-fatal): {e.err}")
+            sessions[sid]["last_mirror_id"] = new_last_id or rec.last_mirror_id
         sessions[sid]["last_status"] = status
 
     def _create_channel(self, name: str, project: str, title: str, sid: str) -> tuple[str, str]:
-        """Create the channel, falling back to a shortid-suffixed name on a
-        conflict. Returns (channel_id, actual_name_used)."""
+        """Create the channel, falling back to progressively-suffixed names on
+        conflicts. Returns (channel_id, actual_name_used)."""
         try:
             return self.slack.create_channel(name, self.cfg.private), name
         except ApiError as e:
             if e.err == "name_taken":
-                # Try to find and unarchive the existing channel.
+                # Try to find and unarchive the existing channel (may be an
+                # old channel for this same session that got archived).
                 try:
                     cid = self.slack.lookup_by_name(name, self.cfg.private)
                     if cid:
@@ -811,9 +878,16 @@ class Bridge:
                         return cid, name
                 except ApiError:
                     pass  # lookup failed (rate limit, etc.) — fall through
-                # Name taken and lookup failed: use the shortid-suffixed name.
+                # Name taken: try the shortid-suffixed name, then numeric
+                # suffixes — covers channels orphaned by previous runs.
                 fb = conflict_name(self.cfg.prefix, project, title, sid)
-                return self.slack.create_channel(fb, self.cfg.private), fb
+                for candidate in [fb] + [f"{fb}-{n}" for n in range(2, 6)]:
+                    try:
+                        return self.slack.create_channel(candidate, self.cfg.private), candidate
+                    except ApiError as e2:
+                        if e2.err != "name_taken":
+                            raise
+                raise ApiError("slack.create", f"all name candidates taken for {name!r}")
             raise
 
     def _alert_text(self, title, project, sid, status, mention) -> str:

@@ -205,3 +205,75 @@ running the bridge to refresh it. The bridge re-reads the token from
 Check that the bot was invited to the workspace and has `channels:manage`
 scope. Run `omnigent-slack-bridge auth` to verify the bot token is valid, and
 `omnigent-slack-bridge scopes` to probe which scopes it actually has.
+
+---
+
+## Always-on deployment in a remote workspace
+
+The reference deployment runs inside a remote dev workspace (container):
+systemd isn't available, the container restarts kill tmux, and the Slack
+tokens are non-exportable workspace secrets only readable inside the
+container. The setup that survives all of that:
+
+### 1. Deploy the files
+
+```bash
+# On the workspace:
+mkdir -p ~/omnigent-slack-bridge
+cp omnigent_slack_bridge.py scripts/run-keeper.sh ~/omnigent-slack-bridge/
+cp scripts/omnigent-token-keeper.py ~/                 # token-keeper daemon
+cp scripts/ensure-daemons.zsh ~/.zshenv.d/omnigent-daemons.zsh  # auto-start hook
+chmod +x ~/omnigent-token-keeper.py ~/omnigent-slack-bridge/*.sh
+```
+
+`run.sh` materializes the Slack secrets from the workspace secrets dir into
+the environment and runs the bridge in an auto-restart loop:
+
+```bash
+#!/usr/bin/env bash
+set -uo pipefail
+SEC="/var/run/user/$(id -u)/secrets"
+export SLACK_BOT_TOKEN="$(cat "$SEC/SLACK_BOT_TOKEN")"
+export SLACK_APP_TOKEN="$(cat "$SEC/SLACK_APP_TOKEN")"
+export SLACK_USER_ID="$(cat "$SEC/SLACK_USER_ID")"
+export OMNIGENT_SLACK_BRIDGE_PREFIX=ck
+while true; do
+  python3 -u ~/omnigent-slack-bridge/omnigent_slack_bridge.py poll
+  echo "[run.sh] bridge exited; restarting in 5s..." >&2
+  sleep 5
+done
+```
+
+### 2. The token-keeper
+
+The Omnigent JWT expires after ~8h. The `omnigent-token-keeper` daemon
+re-logins before expiry (it reads the server URL from
+`~/.omnigent/config.yaml` and credentials from `~/.omnigent/login-credentials`).
+It runs in its own auto-restart loop via `run-keeper.sh`.
+
+The bridge also self-heals: on a 401 it re-reads the token file, tries the
+`refresh_token` exchange, then falls back to re-login with the stored
+credentials.
+
+### 3. Survive container restarts
+
+Container restarts kill tmux (and everything in it). The
+`~/.zshenv.d/omnigent-daemons.zsh` hook is sourced on every shell init, is
+idempotent (`tmux has-session` check), and brings both daemons back the next
+time any shell opens (any SSH login):
+
+- `omnigent-token-keeper` tmux session → `run-keeper.sh`
+- `omnigent-slack-bridge` tmux session → `run.sh` (only starts if the Slack
+  workspace secrets are mounted)
+
+The failure mode this fixes: container restart → both daemons dead → token
+expires → the bridge silently stops creating channels. With the hook, the
+outage lasts only until the next login, and the keeper immediately refreshes
+an expired token.
+
+### 4. Logs
+
+- Bridge: `~/.local/share/omnigent-slack-bridge/poll.log`
+- Keeper: `~/.local/share/omnigent-slack-bridge/keeper.log`
+- Quick health check: `tmux list-sessions` (both sessions present) and
+  `python3 ~/omnigent-token-keeper.py status`

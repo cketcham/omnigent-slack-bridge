@@ -130,6 +130,7 @@ class Config:
     server_url: str = ""
     auth_token: str = ""
     allowed_users: list[str] = field(default_factory=list)
+    disable_create: bool = False  # kill-switch: never create new channels
     state_dir: str = _default_state_dir()
     project: str = ""  # optional Omnigent project filter
 
@@ -190,6 +191,7 @@ def load_config() -> Config:
         server_url=server_url,
         auth_token=auth_token,
         allowed_users=_list(get("OMNIGENT_SLACK_BRIDGE_ALLOWED_USERS")),
+        disable_create=_bool(get("OMNIGENT_SLACK_BRIDGE_DISABLE_CREATE")),
         state_dir=get("OMNIGENT_SLACK_BRIDGE_STATE_DIR") or _default_state_dir(),
         project=get("OMNIGENT_SLACK_BRIDGE_PROJECT"),
     )
@@ -358,6 +360,12 @@ class OmnigentClient:
             "data": {"role": "user", "content": [{"type": "input_text", "text": text}]},
         })
 
+    def get_session(self, session_id: str) -> bool:
+        """True if the session still exists on the server (any state).
+        Raises ApiError on transport/server failure (do NOT treat as gone)."""
+        self._call("GET", f"/v1/sessions/{session_id}")
+        return True
+
     def list_projects(self) -> dict[str, str]:
         """Return {project_id: project_name} for the caller's projects."""
         res = self._call("GET", "/v1/projects")
@@ -451,12 +459,16 @@ class SlackClient:
             if e.err not in ("already_archived", "not_in_channel", "channel_not_found"):
                 raise
 
-    def unarchive(self, channel_id: str) -> None:
+    def unarchive(self, channel_id: str) -> bool:
+        """Unarchive a channel. Returns True on success."""
         try:
             self._call("conversations.unarchive", {"channel": channel_id})
+            return True
         except ApiError as e:
-            if e.err not in ("not_archived", "not_in_channel", "channel_not_found"):
-                raise
+            if e.err in ("not_archived",):
+                return True  # already open — treat as success
+            log(f"slack.unarchive {channel_id}: {e.err}")
+            return False
 
     def set_topic(self, channel_id: str, topic: str) -> None:
         try:
@@ -685,6 +697,26 @@ class Bridge:
                 log(f"outbound: session {sid[:12]} deleted; archived #{rec.channel_name}")
         self.store.update(write)
 
+    def _announce_channel(self, cid: str, sid: str, project: str, title: str) -> None:
+        """Post the intro + topic for a freshly (re)created channel. All
+        best-effort: a failure never aborts the state save."""
+        try:
+            self.slack.invite_user(cid, self.cfg.slack_user_id)
+        except ApiError as e:
+            log(f"invite {cid} (non-fatal): {e.err}")
+        try:
+            label = title or project or "session"
+            intro = f"\U0001f680 Channel for *{label}* (`{sid[:8]}`)."
+            if project:
+                intro += f"\nProject: *{project}*"
+            self.slack.post_message(cid, intro)
+        except ApiError as e:
+            log(f"intro post {cid} (non-fatal): {e.err}")
+        try:
+            self.slack.set_topic(cid, title or project)
+        except ApiError:
+            pass
+
     def _retry_archive(self, sid: str) -> None:
         """Retry archiving a channel for a session that's marked closed in
         state but whose Slack channel is still open (a previous archive
@@ -712,50 +744,54 @@ class Bridge:
         else:
             # Session unarchived: unarchive the channel if it was closed.
             if rec.channel_id and rec.closed:
-                self.slack.unarchive(rec.channel_id)
-                sessions[sid]["closed"] = False
-                self.slack.post_message(rec.channel_id, "📦 session unarchived; channel reopened.")
+                if self.slack.unarchive(rec.channel_id):
+                    sessions[sid]["closed"] = False
+                    try:
+                        self.slack.post_message(rec.channel_id, "📦 session unarchived; channel reopened.")
+                    except ApiError:
+                        pass
+                else:
+                    # Unarchive failed — leave closed for the recreate path below.
+                    pass
 
         # If the channel is closed but the session is still active (not archived),
-        # the channel was lost (archived externally, bot removed, etc.). Create
-        # a fresh channel right away — don't wait for an actionable event,
-        # since a long-running session may never produce one.
+        # the channel was archived (by us or externally). REUSE it: unarchive by
+        # id — never create a new channel (creating on top of an archived name
+        # is the duplicate-channel engine: name_taken → suffix → more channels).
         if rec.closed and not archived:
-            want_name = channel_name(self.cfg.prefix, project, title)
-            try:
-                cid, cname = self._create_channel(want_name, project, title, sid)
-            except ApiError as e:
-                log(f"recreate channel for {sid[:12]}: {e}; will retry next event")
-                sessions[sid]["last_status"] = status
-                return
-            log(f"outbound: recreated channel for {sid[:12]} -> #{cname}")
-            sessions[sid]["channel_id"] = cid
-            sessions[sid]["channel_name"] = cname
-            sessions[sid]["closed"] = False
-            sessions[sid]["mentioned"] = False
-            try:
-                self.slack.invite_user(cid, self.cfg.slack_user_id)
-            except ApiError as e:
-                log(f"invite {cid} (non-fatal): {e.err}")
-            try:
-                label = title or project or "session"
-                intro = f"\U0001f680 Channel for *{label}* (`{sid[:8]}`)."
-                if project:
-                    intro += f"\nProject: *{project}*"
-                self.slack.post_message(cid, intro)
-            except ApiError as e:
-                log(f"intro post {cid} (non-fatal): {e.err}")
-            try:
-                self.slack.set_topic(cid, title or project)
-            except ApiError:
-                pass
-            try:
-                latest = self.omni.list_items(sid, limit=1, order="desc")
-                if latest:
-                    sessions[sid]["last_mirror_id"] = latest[0].get("id", "")
-            except ApiError as e:
-                log(f"seed last_mirror_id {sid} (non-fatal): {e}")
-            rec = self.store.get(sessions, sid)
+            if rec.channel_id:
+                if self.slack.unarchive(rec.channel_id):
+                    sessions[sid]["closed"] = False
+                    sessions[sid]["mentioned"] = False
+                    log(f"outbound: unarchived channel for {sid[:12]} (#{rec.channel_name})")
+                    try:
+                        self.slack.post_message(rec.channel_id, "📦 session active again; channel reopened.")
+                    except ApiError:
+                        pass
+                    rec = self.store.get(sessions, sid)
+                else:
+                    # Unarchive failed (channel truly gone — deleted, bot
+                    # removed). Fall through to create, unless creation is
+                    # disabled.
+                    sessions[sid]["channel_id"] = ""
+            if not sessions[sid].get("channel_id"):
+                if self.cfg.disable_create:
+                    sessions[sid]["last_status"] = status
+                    return
+                want_name = channel_name(self.cfg.prefix, project, title)
+                try:
+                    cid, cname = self._create_channel(want_name, project, title, sid)
+                except ApiError as e:
+                    log(f"recreate channel for {sid[:12]}: {e}; will retry next event")
+                    sessions[sid]["last_status"] = status
+                    return
+                log(f"outbound: recreated channel for {sid[:12]} -> #{cname}")
+                sessions[sid]["channel_id"] = cid
+                sessions[sid]["channel_name"] = cname
+                sessions[sid]["closed"] = False
+                sessions[sid]["mentioned"] = False
+                self._announce_channel(cid, sid, project, title)
+                rec = self.store.get(sessions, sid)
 
         # The channel name tracks the current project + title, so a title
         # change renames the channel live (Slack supports conversations.rename).
@@ -798,6 +834,9 @@ class Bridge:
         # Lazily create the channel on the first actionable event, OR recreate
         # if the channel was lost (archived externally / bot removed).
         if not rec.channel_id or rec.closed:
+            if self.cfg.disable_create:
+                sessions[sid]["last_status"] = status
+                return  # channel creation disabled — no channel for this session
             cid, cname = self._create_channel(want_name, project, title, sid)
             # Persist the channel id IMMEDIATELY so a later failure (invite,
             # post, rate limit) can't orphan the channel from state.
@@ -1057,22 +1096,32 @@ class Bridge:
                     # On a full snapshot (reconnect), detect sessions that were
                     # deleted while we were disconnected: any session in our
                     # state with an open channel that's NOT in the snapshot.
+                    # A session missing from ONE snapshot is NOT proof of
+                    # deletion — snapshots can be partial during imports or
+                    # server flakiness, and archive→recreate cycles on a
+                    # live session mint duplicate channels. Confirm via a
+                    # direct GET first (only 404 counts as deleted).
                     if ftype == "snapshot":
                         snapshot_ids = {it.get("id") for it in items if it.get("id")}
                         for rec in self.store.records():
-                            if not rec.channel_id:
+                            if not rec.channel_id or rec.session_id in snapshot_ids:
                                 continue
-                            # Session not in snapshot = deleted while we were
-                            # disconnected. Archive its channel.
-                            if not rec.closed and rec.session_id not in snapshot_ids:
+                            if rec.closed:
+                                # Already closed; just ensure the archive happened.
+                                await asyncio.to_thread(self._retry_archive, rec.session_id)
+                                continue
+                            # Not in snapshot + open channel: verify deletion.
+                            def _really_gone(sid=rec.session_id) -> bool:
+                                try:
+                                    return not self.omni.get_session(sid)
+                                except ApiError as e:
+                                    return "404" in str(e) or "not_found" in str(e)
+                                except Exception:
+                                    return False  # unknown — do nothing this cycle
+                            if await asyncio.to_thread(_really_gone):
                                 await asyncio.to_thread(self._handle_session_removed, rec.session_id)
                                 if rec.session_id in watched:
                                     watched.remove(rec.session_id)
-                            # Session marked closed in state but channel still
-                            # open in Slack = a previous archive failed (e.g.
-                            # rate limit during a crash loop). Retry the archive.
-                            elif rec.closed and rec.session_id not in snapshot_ids:
-                                await asyncio.to_thread(self._retry_archive, rec.session_id)
                 elif ftype == "removed":
                     # Session was deleted — archive its Slack channel (Slack
                     # doesn't allow bot tokens to delete channels, only archive).

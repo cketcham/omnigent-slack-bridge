@@ -131,6 +131,7 @@ class Config:
     auth_token: str = ""
     allowed_users: list[str] = field(default_factory=list)
     disable_create: bool = False  # kill-switch: never create new channels
+    ops_session: str = ""  # session id that DMs with the bot are routed to
     state_dir: str = _default_state_dir()
     project: str = ""  # optional Omnigent project filter
 
@@ -192,6 +193,7 @@ def load_config() -> Config:
         auth_token=auth_token,
         allowed_users=_list(get("OMNIGENT_SLACK_BRIDGE_ALLOWED_USERS")),
         disable_create=_bool(get("OMNIGENT_SLACK_BRIDGE_DISABLE_CREATE")),
+        ops_session=get("OMNIGENT_SLACK_BRIDGE_OPS_SESSION"),
         state_dir=get("OMNIGENT_SLACK_BRIDGE_STATE_DIR") or _default_state_dir(),
         project=get("OMNIGENT_SLACK_BRIDGE_PROJECT"),
     )
@@ -1045,6 +1047,10 @@ class Bridge:
             # Keep the dedup set bounded.
             if len(self._seen_inbound_ts) > 500:
                 self._seen_inbound_ts = set(list(self._seen_inbound_ts)[-250:])
+        # DMs with the bot are the control/ops channel.
+        if channel_id.startswith("D"):
+            self._handle_dm(channel_id, text)
+            return
         # Look up the session for this channel.
         for rec in self.store.records():
             if rec.channel_id == channel_id and not rec.closed:
@@ -1052,9 +1058,74 @@ class Bridge:
                     self.omni.send_message(rec.session_id, text)
                     log(f"inbound: forwarded to {rec.session_id[:12]} (#{rec.channel_name})")
                 except ApiError as e:
-                    log(f"inbound: forward to {rec.session_id[:12]}: {e}")
+                    # Report the failure back into the channel — silence is
+                    # worse than an error.
+                    self._delivery_failed(channel_id, rec.session_id, e)
                 return
         log(f"inbound: no session for channel {channel_id}")
+
+    def _handle_dm(self, channel_id: str, text: str) -> None:
+        """DM with the bot = control/ops channel. `status` reports bridge
+        health; anything else is forwarded to the configured ops session
+        (OMNIGENT_SLACK_BRIDGE_OPS_SESSION) — an agent session that can be
+        reached even when normal channels are broken."""
+        low = text.strip().lower()
+        if low in ("status", "/status", "help", "/help"):
+            self._reply_dm_status(channel_id, low in ("help", "/help"))
+            return
+        ops_sid = self.cfg.ops_session
+        if not ops_sid:
+            self.slack.post_message(channel_id,
+                "⚠️ No ops session configured. Set OMNIGENT_SLACK_BRIDGE_OPS_SESSION=<session-id> "
+                "in the bridge environment (run.sh). 'status' shows bridge health.")
+            return
+        try:
+            self.omni.send_message(ops_sid, text)
+            log(f"dm: forwarded to ops session {ops_sid[:12]}")
+        except ApiError as e:
+            self._delivery_failed(channel_id, ops_sid, e)
+
+    def _reply_dm_status(self, channel_id: str, is_help: bool) -> None:
+        """Reply in the DM with a bridge health summary (or help text)."""
+        try:
+            lines = []
+            if is_help:
+                lines.append("*omnigent-slack-bridge DM console")
+                lines.append("• `status` — bridge health summary")
+                lines.append("• anything else — forwarded to the ops session "
+                             "(`OMNIGENT_SLACK_BRIDGE_OPS_SESSION`) so an agent can act on it")
+            else:
+                recs = self.store.records()
+                open_ch = [r for r in recs if r.channel_id and not r.closed]
+                lines.append(f"*bridge status*")
+                lines.append(f"• sessions tracked: {len(recs)} ({len(open_ch)} with channels)")
+                lines.append(f"• channel creation: {'disabled' if self.cfg.disable_create else 'enabled'}")
+                lines.append(f"• ops session: {self.cfg.ops_session[:12] if self.cfg.ops_session else '(not configured)'}")
+                # Token freshness
+                entry = _load_token_entry(self.cfg.server_url) or {}
+                exp = entry.get("expires_at", 0)
+                remaining = (exp - time.time()) / 3600
+                lines.append(f"• omnigent token: {'expired %.1fh ago' % -remaining if remaining < 0 else '%.1fh remaining' % remaining}")
+                # Recent log tail
+                try:
+                    log_path = Path(self.cfg.state_dir) / "poll.log"
+                    tail = log_path.read_text().strip().splitlines()[-3:]
+                    lines.append("• recent log:")
+                    lines.extend(f"    {t}" for t in tail)
+                except OSError:
+                    pass
+            self.slack.post_message(channel_id, "\n".join(lines))
+        except Exception as e:
+            log(f"dm status reply failed: {e}")
+
+    def _delivery_failed(self, channel_id: str, sid: str, err: ApiError) -> None:
+        """Post a delivery-failure notice back into the originating Slack
+        channel. Best-effort — never raises."""
+        try:
+            self.slack.post_message(channel_id, f"⚠️ Delivery to session {sid[:12]} failed: {err}")
+            log(f"inbound: forward to {sid[:12]} FAILED: {err}")
+        except ApiError:
+            pass
 
     def _user_allowed(self, user: str) -> bool:
         if not self.cfg.allowed_users:

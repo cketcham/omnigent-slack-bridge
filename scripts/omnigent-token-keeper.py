@@ -124,8 +124,27 @@ def _login(server_url: str, username: str, password: str) -> dict | None:
         return None
 
 
+def _probe_token(server_url: str, token: str) -> bool | None:
+    """Cheap liveness probe: GET /v1/sessions?limit=1 with the current token.
+    True = valid, False = rejected (401 — invalidated by a server redeploy
+    even though expires_at claims it's valid), None = unreachable/5xx."""
+    req = urllib.request.Request(server_url.rstrip("/") + "/v1/sessions?limit=1")
+    req.add_header("Authorization", "Bearer " + token)
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return True
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            return False
+        return None  # 5xx / other — server trouble, not a token problem
+    except (urllib.error.URLError, OSError):
+        return None
+
+
 def refresh_if_needed(server_url: str) -> bool:
-    """Re-login if the token expires within REFRESH_THRESHOLD. Returns True if refreshed."""
+    """Re-login when the token expires within REFRESH_THRESHOLD **or** when
+    a liveness probe shows the server rejects it (a redeploy invalidates
+    issued JWTs while their expires_at still claims validity)."""
     entry = _load_token_entry(server_url)
     if entry is None:
         log(f"no token entry for {server_url}")
@@ -136,16 +155,29 @@ def refresh_if_needed(server_url: str) -> bool:
         return False
 
     remaining = expires_at - time.time()
+    reason = None
     if remaining > REFRESH_THRESHOLD:
-        return False  # still plenty of lifetime
+        # Plenty of lifetime per the clock — but the server may have been
+        # redeployed and invalidated the JWT. Probe; only a definitive 401
+        # triggers a re-login (5xx/unreachable means server trouble, and
+        # logging in then would fail anyway).
+        token = entry.get("token")
+        if not isinstance(token, str) or not token:
+            return False
+        probe = _probe_token(server_url, token)
+        if probe is not False:
+            return False  # healthy (or server unreachable — nothing to do)
+        reason = "server rejects token (401) despite valid expiry — redeployed?"
+    else:
+        reason = f"token expires in {remaining/60:.0f}m"
 
     creds = _read_credentials()
     if not creds:
-        log(f"token expires in {remaining/60:.0f}m but no login-credentials file")
+        log(f"{reason} but no login-credentials file")
         return False
 
     username, password = creds
-    log(f"token expires in {remaining/60:.0f}m; re-logging in as {username}...")
+    log(f"{reason}; re-logging in as {username}...")
     result = _login(server_url, username, password)
     if result is None or not result.get("token"):
         log("re-login failed")

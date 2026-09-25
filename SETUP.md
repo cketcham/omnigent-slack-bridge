@@ -240,6 +240,7 @@ export OMNIGENT_SLACK_BRIDGE_PREFIX=ck
 # Kill-switch: block ALL channel creation (existing channels still work).
 # Use while debugging or cleaning up duplicate channels.
 # export OMNIGENT_SLACK_BRIDGE_DISABLE_CREATE=true
+# export OMNIGENT_SLACK_BRIDGE_OPS_SESSION=<session-id>  # DMs with the bot route here
 exec 9>"$HOME/omnigent-slack-bridge/.bridge.lock"
 # Single-instance guard: an orphaned wrapper that survived a tmux death
 # exits here instead of running a duplicate bridge.

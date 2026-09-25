@@ -194,6 +194,24 @@ kept synced to the session `title`.
 | `OMNIGENT_SLACK_BRIDGE_PROJECT` | (none) | Scope to one Omnigent project; empty = all your sessions. |
 | `OMNIGENT_SLACK_BRIDGE_STATE_DIR` | `~/.local/share/omnigent-slack-bridge` | State file location. |
 
+## DM console (ops channel)
+
+DMs with the bot are a control channel that works even when normal channels
+are broken (Socket Mode event delivery is not subject to Web API rate limits):
+
+- `status` — the bot replies with a bridge health summary: sessions tracked,
+  channel-creation state, ops session, token freshness, and the last log lines
+- `help` — quick usage text
+- anything else — forwarded to the configured **ops session**
+  (`OMNIGENT_SLACK_BRIDGE_OPS_SESSION`): an agent session (e.g. one running on
+  the bridge host with SSH access) that can investigate and fix problems
+
+If a forward fails (in a DM or any channel), the bot posts a ⚠️ error back
+into Slack immediately — delivery failures are never silent.
+
+The bot needs `message.im` subscribed and `im:write` scope to reply — both are
+in the manifest.
+
 ## Commands
 
 | Command | What it does |

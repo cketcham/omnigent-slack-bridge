@@ -687,7 +687,20 @@ class Bridge:
 
     def _handle_session_removed(self, sid: str) -> None:
         """A session was deleted from Omnigent. Archive its Slack channel
-        (Slack doesn't allow bot tokens to delete channels, only archive)."""
+        (Slack doesn't allow bot tokens to delete channels, only archive).
+        The removal signal (removed frame / snapshot miss) is VERIFIED with a
+        direct GET first: only a definitive 404 archives. Transient server
+        flapping (503s, partial reads) must not archive a live session's
+        channel — the false-archive → recreate cycle is the duplicate-channel
+        engine."""
+        try:
+            if self.omni.get_session(sid):
+                log(f"outbound: removal signal for {sid[:12]} but session exists; ignoring")
+                return
+        except ApiError as e:
+            if "404" not in str(e) and "not_found" not in str(e):
+                log(f"outbound: removal signal for {sid[:12]} unverifiable ({e}); ignoring")
+                return
         def write(sessions: dict[str, Any]) -> None:
             rec = self.store.get(sessions, sid)
             if rec.channel_id and not rec.closed:
@@ -807,10 +820,14 @@ class Bridge:
         sessions[sid]["title"] = title
 
         # Rename the channel when the desired name diverges from the current one.
-        if rec.channel_id and rec.channel_name and rec.channel_name != want_name:
+        # Skip if this want_name is already known taken (recorded below) so a
+        # taken name doesn't retry on every websocket frame.
+        if (rec.channel_id and rec.channel_name and rec.channel_name != want_name
+                and sessions[sid].get("name_taken") != want_name):
             result = self.slack.rename(rec.channel_id, want_name)
             if result == "ok":
                 sessions[sid]["channel_name"] = want_name
+                sessions[sid].pop("name_taken", None)
                 rec = self.store.get(sessions, sid)
             elif result == "gone":
                 # Channel no longer exists — reset so a fresh one is created below.
@@ -818,8 +835,11 @@ class Bridge:
                 sessions[sid]["closed"] = True
                 log(f"outbound: channel gone for {sid[:12]}; will recreate")
                 rec = self.store.get(sessions, sid)
-            # 'taken' (name held by another channel): keep the current channel
-            # and name — not an error, don't recreate.
+            elif result == "taken":
+                # Name held by another channel: keep the current channel and
+                # name; record it so we stop retrying until the title changes.
+                sessions[sid]["name_taken"] = want_name
+                log(f"outbound: name {want_name!r} taken; keeping current name for {sid[:12]}")
 
         # Keep the channel topic synced to the session title too.
         if rec.channel_id and title and rec.title != title:

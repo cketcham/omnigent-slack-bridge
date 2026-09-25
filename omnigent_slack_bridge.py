@@ -1017,6 +1017,11 @@ class Bridge:
         client.web_client = WebClient(token=self.cfg.slack_bot_token)
 
         def handler(cli, req: SocketModeRequest) -> None:
+            # Debug: log every events_api payload type so silent event-routing
+            # issues (e.g. missing message.im subscription) are visible.
+            if req.type == "events_api":
+                ev = req.payload.get("event", {})
+                log(f"inbound: event {ev.get('type','?')} chan={ev.get('channel','?')[:12]}")
             if req.type == "events_api":
                 event = req.payload.get("event", {})
                 if event.get("type") == "message" and not event.get("bot_id") and not event.get("subtype"):

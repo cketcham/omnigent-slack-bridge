@@ -237,6 +237,13 @@ export SLACK_BOT_TOKEN="$(cat "$SEC/SLACK_BOT_TOKEN")"
 export SLACK_APP_TOKEN="$(cat "$SEC/SLACK_APP_TOKEN")"
 export SLACK_USER_ID="$(cat "$SEC/SLACK_USER_ID")"
 export OMNIGENT_SLACK_BRIDGE_PREFIX=ck
+# Kill-switch: block ALL channel creation (existing channels still work).
+# Use while debugging or cleaning up duplicate channels.
+# export OMNIGENT_SLACK_BRIDGE_DISABLE_CREATE=true
+exec 9>"$HOME/omnigent-slack-bridge/.bridge.lock"
+# Single-instance guard: an orphaned wrapper that survived a tmux death
+# exits here instead of running a duplicate bridge.
+flock -n 9 || { echo "[run.sh] another bridge holds the lock; exiting"; exit 0; }
 while true; do
   python3 -u ~/omnigent-slack-bridge/omnigent_slack_bridge.py poll
   echo "[run.sh] bridge exited; restarting in 5s..." >&2

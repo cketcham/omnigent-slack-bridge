@@ -920,6 +920,15 @@ class Bridge:
                         sessions[sid]["last_seen_ts"] = mts
                 except ApiError as e:
                     log(f"mirror post {cid} (non-fatal): {e.err}")
+                # Ops session: also deliver the reply into the user's DM so
+                # the DM conversation is two-way.
+                dm_cid = sessions[sid].get("dm_channel") or ""
+                if sid == self.cfg.ops_session and dm_cid:
+                    try:
+                        self.slack.post_message(dm_cid, new_text)
+                        log(f"dm: replied to DM {dm_cid} for ops session")
+                    except ApiError as e:
+                        log(f"dm reply {dm_cid} (non-fatal): {e.err}")
             sessions[sid]["last_mirror_id"] = new_last_id or rec.last_mirror_id
         sessions[sid]["last_status"] = status
 
@@ -1086,6 +1095,9 @@ class Bridge:
             return
         try:
             self.omni.send_message(ops_sid, text)
+            # Remember the DM channel so the ops agent's reply (mirrored on
+            # turn-end) is posted back into this DM, not just its channel.
+            self._set_field(ops_sid, "dm_channel", channel_id)
             log(f"dm: forwarded to ops session {ops_sid[:12]}")
         except ApiError as e:
             self._delivery_failed(channel_id, ops_sid, e)

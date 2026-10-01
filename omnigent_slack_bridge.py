@@ -623,7 +623,6 @@ class StateStore:
                 last_seen_ts=r.get("last_seen_ts", ""),
                 mentioned=r.get("mentioned", False),
                 closed=r.get("closed", False),
-            archived_ok=r.get("archived_ok", False),
                 archived_ok=r.get("archived_ok", False),
                 created_at=r.get("created_at", 0),
             ))
@@ -642,6 +641,7 @@ class StateStore:
             last_seen_ts=r.get("last_seen_ts", ""),
             mentioned=r.get("mentioned", False),
             closed=r.get("closed", False),
+            archived_ok=r.get("archived_ok", False),
             created_at=r.get("created_at", 0),
         )
 

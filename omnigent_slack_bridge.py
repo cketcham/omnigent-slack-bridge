@@ -576,6 +576,7 @@ class SessionRecord:
     last_seen_ts: str = ""
     mentioned: bool = False
     closed: bool = False
+    archived_ok: bool = False  # closed + Slack channel confirmed archived (skip retry)
     created_at: int = 0
 
 
@@ -622,6 +623,8 @@ class StateStore:
                 last_seen_ts=r.get("last_seen_ts", ""),
                 mentioned=r.get("mentioned", False),
                 closed=r.get("closed", False),
+            archived_ok=r.get("archived_ok", False),
+                archived_ok=r.get("archived_ok", False),
                 created_at=r.get("created_at", 0),
             ))
         return out
@@ -746,14 +749,29 @@ class Bridge:
         state but whose Slack channel is still open (a previous archive
         call failed, e.g. during a rate-limit window). Slack calls happen
         OUTSIDE the state lock — a 30s rate-limit backoff inside the lock
-        would block inbound DM processing."""
+        would block inbound DM processing. CONVERGES: once the channel is
+        confirmed archived (or gone), archived_ok is set and the snapshot
+        path skips this session entirely."""
         rec = next((r for r in self.store.records() if r.session_id == sid), None)
-        if not rec or not rec.channel_id:
+        if not rec or not rec.channel_id or rec.archived_ok:
             return
-        # Best-effort check: skip quietly if already archived (conversations.info
-        # tolerates archived channels) to avoid burning archive rate limit.
-        self.slack.archive(rec.channel_id)
-        log(f"outbound: retried archive for {sid[:12]} (#{rec.channel_name})")
+        # Confirm via conversations.info FIRST: archiving an already-archived
+        # channel returns already_archived, but a ratelimited bucket rejects
+        # the call before that check — blind archive retries never converge.
+        info = self.slack._call("conversations.info", {"channel": rec.channel_id}, post=False)
+        ch = info.get("channel", {}) if info.get("ok") else {}
+        if not info.get("ok"):
+            return  # channel gone / rate limited — retry next cycle
+        if ch.get("is_archived"):
+            self._set_field(sid, "archived_ok", True)
+            log(f"outbound: {sid[:12]} (#{rec.channel_name}) already archived; confirmed")
+            return
+        try:
+            self.slack.archive(rec.channel_id)
+            self._set_field(sid, "archived_ok", True)
+            log(f"outbound: retried archive for {sid[:12]} (#{rec.channel_name}) — done")
+        except ApiError as e:
+            log(f"archive {rec.channel_id} (retry next snapshot): {e.err}")
 
     def _mutate(self, sessions, sid, project, title, status, archived, blocked) -> None:
         rec = self.store.get(sessions, sid)
@@ -1226,6 +1244,8 @@ class Bridge:
                             if not rec.channel_id or rec.session_id in snapshot_ids:
                                 continue
                             if rec.closed:
+                                if rec.archived_ok:
+                                    continue  # already confirmed archived — skip
                                 # Already closed; just ensure the archive happened.
                                 # Wrapped: a Slack failure here must NEVER crash
                                 # the websocket (the retry just happens next cycle).

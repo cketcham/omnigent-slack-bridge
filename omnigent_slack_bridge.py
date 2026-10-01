@@ -910,8 +910,12 @@ class Bridge:
             sessions[sid]["last_status"] = status
             return
 
-        # Turn-end: mirror new assistant output.
-        if is_turn_end and rec.last_status != "idle":
+        # Turn-end: mirror new assistant output. Trigger on every idle
+        # sighting (not just the transition edge): the websocket's diff scan
+        # can miss brief `running` states, so relying on last_status != "idle"
+        # would skip mirroring whole turns. The last_mirror_id cursor below
+        # already ensures only NEW items are posted.
+        if is_turn_end:
             new_text, new_last_id = self._new_assistant_text(sid, rec.last_mirror_id)
             if new_text.strip():
                 try:

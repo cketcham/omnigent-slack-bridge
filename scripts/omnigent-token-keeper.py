@@ -141,10 +141,36 @@ def _probe_token(server_url: str, token: str) -> bool | None:
         return None
 
 
+def _refresh_via_grant(server_url: str, entry: dict) -> bool:
+    """Exchange the stored refresh_token at /oauth/token (works for SSO-issued
+    sessions — production). Returns True and persists on success."""
+    rt = entry.get("refresh_token")
+    if not isinstance(rt, str) or not rt:
+        return False
+    body = urllib.parse.urlencode({"grant_type": "refresh_token", "refresh_token": rt}).encode()
+    req = urllib.request.Request(server_url.rstrip("/") + "/oauth/token", data=body, method="POST")
+    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            out = json.loads(resp.read().decode())
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError, json.JSONDecodeError) as e:
+        log(f"refresh grant failed: {e}")
+        return False
+    new_token = out.get("access_token") or out.get("token") or ""
+    if not new_token:
+        return False
+    expires_in = out.get("expires_in", DEFAULT_EXPIRES_IN)
+    _store_token(server_url, new_token, out.get("refresh_token") or rt, expires_in)
+    log(f"refreshed via grant; token valid {expires_in // 3600}h")
+    return True
+
+
 def refresh_if_needed(server_url: str) -> bool:
-    """Re-login when the token expires within REFRESH_THRESHOLD **or** when
-    a liveness probe shows the server rejects it (a redeploy invalidates
-    issued JWTs while their expires_at still claims validity)."""
+    """Refresh when the token expires within REFRESH_THRESHOLD **or** when a
+    liveness probe shows the server rejects it (a redeploy invalidates issued
+    JWTs while their expires_at still claims validity). Tries the refresh
+    grant first (SSO/production), then falls back to a credentials re-login
+    (accounts/staging)."""
     entry = _load_token_entry(server_url)
     if entry is None:
         log(f"no token entry for {server_url}")
@@ -159,8 +185,7 @@ def refresh_if_needed(server_url: str) -> bool:
     if remaining > REFRESH_THRESHOLD:
         # Plenty of lifetime per the clock — but the server may have been
         # redeployed and invalidated the JWT. Probe; only a definitive 401
-        # triggers a re-login (5xx/unreachable means server trouble, and
-        # logging in then would fail anyway).
+        # triggers a refresh (5xx/unreachable means server trouble).
         token = entry.get("token")
         if not isinstance(token, str) or not token:
             return False
@@ -171,13 +196,23 @@ def refresh_if_needed(server_url: str) -> bool:
     else:
         reason = f"token expires in {remaining/60:.0f}m"
 
+    log(f"{reason}; refreshing...")
+
+    # Strategy 1: refresh grant (production / SSO).
+    entry = _load_token_entry(server_url) or {}
+    if entry.get("refresh_token"):
+        if _refresh_via_grant(server_url, entry):
+            return True
+        log("refresh grant failed; falling back to credentials")
+
+    # Strategy 2: credentials re-login (staging / accounts mode).
     creds = _read_credentials()
     if not creds:
-        log(f"{reason} but no login-credentials file")
+        log("no login-credentials file")
         return False
 
     username, password = creds
-    log(f"{reason}; re-logging in as {username}...")
+    log(f"re-logging in as {username}...")
     result = _login(server_url, username, password)
     if result is None or not result.get("token"):
         log("re-login failed")

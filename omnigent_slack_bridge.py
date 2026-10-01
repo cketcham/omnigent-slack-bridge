@@ -703,14 +703,23 @@ class Bridge:
             if "404" not in str(e) and "not_found" not in str(e):
                 log(f"outbound: removal signal for {sid[:12]} unverifiable ({e}); ignoring")
                 return
-        def write(sessions: dict[str, Any]) -> None:
-            rec = self.store.get(sessions, sid)
-            if rec.channel_id and not rec.closed:
-                self.slack.post_message(rec.channel_id, "📦 session deleted; archiving this channel.")
-                self.slack.archive(rec.channel_id)
-                sessions[sid]["closed"] = True
-                log(f"outbound: session {sid[:12]} deleted; archived #{rec.channel_name}")
-        self.store.update(write)
+        # Read state under the lock, then call Slack OUTSIDE the lock — Slack
+        # calls can sleep 30s+ in rate-limit backoff, and holding the state
+        # lock that long blocks inbound DM processing entirely.
+        rec = next((r for r in self.store.records() if r.session_id == sid), None)
+        if not rec or not rec.channel_id or rec.closed:
+            return
+        try:
+            self.slack.post_message(rec.channel_id, "📦 session deleted; archiving this channel.")
+        except ApiError:
+            pass
+        try:
+            self.slack.archive(rec.channel_id)
+        except ApiError as e:
+            log(f"archive {rec.channel_id} (will retry next snapshot): {e.err}")
+            return  # not closed yet — retried next cycle
+        self._set_field(sid, "closed", True)
+        log(f"outbound: session {sid[:12]} deleted; archived #{rec.channel_name}")
 
     def _announce_channel(self, cid: str, sid: str, project: str, title: str) -> None:
         """Post the intro + topic for a freshly (re)created channel. All
@@ -735,13 +744,16 @@ class Bridge:
     def _retry_archive(self, sid: str) -> None:
         """Retry archiving a channel for a session that's marked closed in
         state but whose Slack channel is still open (a previous archive
-        call failed, e.g. during a rate-limit crash loop)."""
-        def write(sessions: dict[str, Any]) -> None:
-            rec = self.store.get(sessions, sid)
-            if rec.channel_id:
-                self.slack.archive(rec.channel_id)
-                log(f"outbound: retried archive for {sid[:12]} (#{rec.channel_name})")
-        self.store.update(write)
+        call failed, e.g. during a rate-limit window). Slack calls happen
+        OUTSIDE the state lock — a 30s rate-limit backoff inside the lock
+        would block inbound DM processing."""
+        rec = next((r for r in self.store.records() if r.session_id == sid), None)
+        if not rec or not rec.channel_id:
+            return
+        # Best-effort check: skip quietly if already archived (conversations.info
+        # tolerates archived channels) to avoid burning archive rate limit.
+        self.slack.archive(rec.channel_id)
+        log(f"outbound: retried archive for {sid[:12]} (#{rec.channel_name})")
 
     def _mutate(self, sessions, sid, project, title, status, archived, blocked) -> None:
         rec = self.store.get(sessions, sid)
@@ -1215,7 +1227,12 @@ class Bridge:
                                 continue
                             if rec.closed:
                                 # Already closed; just ensure the archive happened.
-                                await asyncio.to_thread(self._retry_archive, rec.session_id)
+                                # Wrapped: a Slack failure here must NEVER crash
+                                # the websocket (the retry just happens next cycle).
+                                try:
+                                    await asyncio.to_thread(self._retry_archive, rec.session_id)
+                                except Exception as e:
+                                    log(f"archive retry {rec.session_id[:12]} (non-fatal): {e}")
                                 continue
                             # Not in snapshot + open channel: verify deletion.
                             def _really_gone(sid=rec.session_id) -> bool:
@@ -1226,7 +1243,10 @@ class Bridge:
                                 except Exception:
                                     return False  # unknown — do nothing this cycle
                             if await asyncio.to_thread(_really_gone):
-                                await asyncio.to_thread(self._handle_session_removed, rec.session_id)
+                                try:
+                                    await asyncio.to_thread(self._handle_session_removed, rec.session_id)
+                                except Exception as e:
+                                    log(f"removed handling {rec.session_id[:12]} (non-fatal): {e}")
                                 if rec.session_id in watched:
                                     watched.remove(rec.session_id)
                 elif ftype == "removed":
@@ -1234,7 +1254,10 @@ class Bridge:
                     # doesn't allow bot tokens to delete channels, only archive).
                     ids = frame.get("ids", [])
                     for sid in ids:
-                        await asyncio.to_thread(self._handle_session_removed, sid)
+                        try:
+                            await asyncio.to_thread(self._handle_session_removed, sid)
+                        except Exception as e:
+                            log(f"removed handling {sid[:12]} (non-fatal): {e}")
                         if sid in watched:
                             watched.remove(sid)
 

@@ -879,13 +879,14 @@ class Bridge:
 
         is_turn_end = status == "idle"
         is_alert = blocked or status == "failed"
-        if not (is_alert or is_turn_end):
-            sessions[sid]["last_status"] = status
-            return  # running / unknown — nothing to say
+        actionable = is_alert or is_turn_end
 
         # Lazily create the channel on the first actionable event, OR recreate
         # if the channel was lost (archived externally / bot removed).
-        if not rec.channel_id or rec.closed:
+        # Non-actionable (running) sessions fall through to the mid-turn
+        # mirror below — they never create channels, but DO mirror if they
+        # already have one.
+        if actionable and (not rec.channel_id or rec.closed):
             if self.cfg.disable_create:
                 sessions[sid]["last_status"] = status
                 return  # channel creation disabled — no channel for this session
@@ -940,12 +941,17 @@ class Bridge:
             sessions[sid]["last_status"] = status
             return
 
-        # Turn-end: mirror new assistant output. Trigger on every idle
-        # sighting (not just the transition edge): the websocket's diff scan
-        # can miss brief `running` states, so relying on last_status != "idle"
-        # would skip mirroring whole turns. The last_mirror_id cursor below
-        # already ensures only NEW items are posted.
-        if is_turn_end:
+        # Mirror new assistant output — BOTH mid-turn and at turn-end.
+        # Mid-turn: while the session is running, the websocket pushes changed
+        # frames every ~4s whenever items persist (updated_at bumps), so a long
+        # turn's intermediate assistant messages surface as they complete.
+        # Throttled to one check per ~10s per session (turn-end always checks
+        # so the final output is never missed). The last_mirror_id cursor
+        # ensures only NEW items are ever posted.
+        mirror_due = (is_turn_end or status == "running") and rec.channel_id and not rec.closed
+        last_check = sessions[sid].get("last_mirror_check") or 0.0
+        if mirror_due and (is_turn_end or time.monotonic() - last_check > 10):
+            sessions[sid]["last_mirror_check"] = time.monotonic()
             new_text, new_last_id = self._new_assistant_text(sid, rec.last_mirror_id)
             if new_text.strip():
                 try:
@@ -963,7 +969,8 @@ class Bridge:
                         log(f"dm: replied to DM {dm_cid} for ops session")
                     except ApiError as e:
                         log(f"dm reply {dm_cid} (non-fatal): {e.err}")
-            sessions[sid]["last_mirror_id"] = new_last_id or rec.last_mirror_id
+            if new_last_id and new_last_id != rec.last_mirror_id:
+                sessions[sid]["last_mirror_id"] = new_last_id
         sessions[sid]["last_status"] = status
 
     def _create_channel(self, name: str, project: str, title: str, sid: str) -> tuple[str, str]:
@@ -1022,6 +1029,11 @@ class Bridge:
             if not items:
                 break
             for it in items:
+                # Stop at in-progress items: their text may be partial, and
+                # advancing the cursor past them would skip their completed
+                # form later (same id, cursor is id-based).
+                if it.get("status") not in (None, "", "completed"):
+                    break
                 if it.get("type") == "message" and it.get("role") == "assistant":
                     for block in it.get("content") or []:
                         if block.get("type") in ("output_text", "text"):
@@ -1029,9 +1041,12 @@ class Bridge:
                             if t:
                                 texts.append(t)
                 new_last = it.get("id", "") or new_last
-            cursor = new_last
-            if len(items) < 200:
-                break
+            else:
+                cursor = new_last
+                if len(items) < 200:
+                    break
+                continue
+            break  # hit an in-progress item — stop this turn
         return "\n\n".join(texts), new_last
 
     # -- inbound: Socket Mode (real-time push, no polling) -------------

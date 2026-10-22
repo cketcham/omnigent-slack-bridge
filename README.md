@@ -250,3 +250,15 @@ rm -f ~/.local/bin/omnigent-slack-bridge \
       ~/.config/systemd/user/omnigent-slack-bridge.service
 rm -rf ~/.config/omnigent-slack-bridge ~/.local/share/omnigent-slack-bridge
 ```
+
+## Reliability checks
+
+Run `python3 -m unittest discover -s tests` for offline regression tests.
+Known channels retain their saved IDs when Slack denies access or unarchive;
+restore membership/permissions to recover rather than creating replacements.
+Channel and DM mirror cursors advance independently after successful posts.
+The bridge, keeper, and omni-cron serialize token refresh using
+`~/.omnigent/auth_tokens.lock` and write private, unique temporary files.
+External CLI versions that do not acquire this lock can still race cache writes.
+An API request accepted before a connection failure or process crash can be
+repeated; these APIs do not promise exactly-once delivery.

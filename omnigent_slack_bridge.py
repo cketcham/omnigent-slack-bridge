@@ -24,6 +24,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import functools
+import fcntl
+import tempfile
 import os
 import re
 import sys
@@ -40,6 +43,22 @@ from typing import Any
 # ──────────────────────────────────────────────────────────────────────────
 
 DEFAULT_PREFIX = "ck"
+
+
+def _serialized_refresh(fn):
+    """Coordinate refresh-token rotation across cron, bridge, and keeper.
+
+    The CLI may also write this cache; this advisory lock coordinates these
+    three daemons, not external clients that do not use the lock.
+    """
+    @functools.wraps(fn)
+    def wrapped(*args, **kwargs):
+        path = Path.home() / ".omnigent" / "auth_tokens.lock"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            return fn(*args, **kwargs)
+    return wrapped
 
 
 def _default_config_dir() -> str:
@@ -102,9 +121,15 @@ def _store_token(server_url: str, token: str, refresh_token: str, prev: dict[str
         entry["refresh_token"] = refresh_token
     entry["expires_at"] = time.time() + expires_in
     data[server_url] = entry
-    tmp = str(path) + ".tmp"
-    Path(tmp).write_text(json.dumps(data, indent=2))
-    os.replace(tmp, str(path))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, path)
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+
 
 
 def _load_login_credentials() -> tuple[str, str] | None:
@@ -268,10 +293,15 @@ class OmnigentClient:
             return True
         return False
 
+    @_serialized_refresh
     def _refresh_via_server(self) -> bool:
         """Try to get a fresh token. The token-keeper daemon is the primary
         mechanism; this is a fallback for when the keeper isn't running.
         Tries refresh_token exchange, then re-login with stored credentials."""
+        cached = _load_token(self.cfg.server_url)
+        if cached and cached != self._token:
+            self._token = cached
+            return True
         # Strategy 1: refresh token exchange.
         entry = _load_token_entry(self.cfg.server_url) or {}
         rt = entry.get("refresh_token") if entry else ""
@@ -292,7 +322,7 @@ class OmnigentClient:
             if not new_token:
                 return False
             self._token = new_token
-            _store_token(self.cfg.server_url, new_token, new_refresh, entry)
+            _store_token(self.cfg.server_url, new_token, new_refresh, entry, out.get("expires_in", 8 * 3600))
             return True
         # Strategy 2: re-login with stored credentials (fallback if keeper isn't running).
         creds = _load_login_credentials()
@@ -458,7 +488,7 @@ class SlackClient:
         try:
             self._call("conversations.archive", {"channel": channel_id})
         except ApiError as e:
-            if e.err not in ("already_archived", "not_in_channel", "channel_not_found"):
+            if e.err != "already_archived":
                 raise
 
     def unarchive(self, channel_id: str) -> bool:
@@ -495,7 +525,7 @@ class SlackClient:
                 log(f"slack.rename {channel_id}: name {name!r} taken; keeping current name")
                 return "taken"
             log(f"slack.rename {channel_id}: {e.err}")
-            return "ok"  # unknown error — assume non-fatal, keep the channel
+            return "retry"  # preserve the old name so a later update retries
 
     def lookup_by_name(self, name: str, private: bool) -> str:
         """Find a channel id by name. In large workspaces (20k+ channels)
@@ -605,8 +635,10 @@ class StateStore:
         with self._lock:
             data = self._load()
             sessions: dict[str, Any] = data.setdefault("sessions", {})
-            fn(sessions)
-            self._save(data)
+            try:
+                fn(sessions)
+            finally:
+                self._save(data)
 
     def records(self) -> list[SessionRecord]:
         data = self._load()
@@ -685,10 +717,24 @@ class Bridge:
         pending = int(s.get("pending_elicitations_count") or 0)
         blocked = status == "waiting" or pending > 0
 
-        def write(sessions: dict[str, Any]) -> None:
+        # Outbound events are processed serially by the websocket loop.
+        # Work on a snapshot so Slack backoff never holds the state lock.
+        before = dict(self.store._load().get("sessions", {}).get(sid, {}))
+        sessions = {sid: dict(before)}
+        try:
             self._mutate(sessions, sid, project, title, status, archived, blocked)
-
-        self.store.update(write)
+        finally:
+            after = sessions[sid]
+            def merge(records):
+                current = records.setdefault(sid, {})
+                for key in before.keys() - after.keys():
+                    current.pop(key, None)
+                for key, value in after.items():
+                    if key not in before or before[key] != value:
+                        current[key] = value
+            # Merge only changed fields: an inbound DM may have set its
+            # destination while this outbound operation was waiting on Slack.
+            self.store.update(merge)
 
     def _handle_session_removed(self, sid: str) -> None:
         """A session was deleted from Omnigent. Archive its Slack channel
@@ -703,7 +749,7 @@ class Bridge:
                 log(f"outbound: removal signal for {sid[:12]} but session exists; ignoring")
                 return
         except ApiError as e:
-            if "404" not in str(e) and "not_found" not in str(e):
+            if e.source != "omnigent" or e.err != "http 404":
                 log(f"outbound: removal signal for {sid[:12]} unverifiable ({e}); ignoring")
                 return
         # Read state under the lock, then call Slack OUTSIDE the lock — Slack
@@ -781,62 +827,21 @@ class Bridge:
         # Archived session: archive its channel. Unarchived: unarchive it.
         if archived:
             if rec.channel_id and not rec.closed:
-                self.slack.post_message(rec.channel_id, "📦 session archived; archiving this channel.")
+                try:
+                    self.slack.post_message(rec.channel_id, "📦 session archived; archiving this channel.")
+                except ApiError:
+                    pass
                 self.slack.archive(rec.channel_id)
                 sessions[sid]["closed"] = True
             sessions[sid]["last_status"] = status
             return
-        else:
-            # Session unarchived: unarchive the channel if it was closed.
-            if rec.channel_id and rec.closed:
-                if self.slack.unarchive(rec.channel_id):
-                    sessions[sid]["closed"] = False
-                    try:
-                        self.slack.post_message(rec.channel_id, "📦 session unarchived; channel reopened.")
-                    except ApiError:
-                        pass
-                else:
-                    # Unarchive failed — leave closed for the recreate path below.
-                    pass
-
-        # If the channel is closed but the session is still active (not archived),
-        # the channel was archived (by us or externally). REUSE it: unarchive by
-        # id — never create a new channel (creating on top of an archived name
-        # is the duplicate-channel engine: name_taken → suffix → more channels).
-        if rec.closed and not archived:
-            if rec.channel_id:
-                if self.slack.unarchive(rec.channel_id):
-                    sessions[sid]["closed"] = False
-                    sessions[sid]["mentioned"] = False
-                    log(f"outbound: unarchived channel for {sid[:12]} (#{rec.channel_name})")
-                    try:
-                        self.slack.post_message(rec.channel_id, "📦 session active again; channel reopened.")
-                    except ApiError:
-                        pass
-                    rec = self.store.get(sessions, sid)
-                else:
-                    # Unarchive failed (channel truly gone — deleted, bot
-                    # removed). Fall through to create, unless creation is
-                    # disabled.
-                    sessions[sid]["channel_id"] = ""
-            if not sessions[sid].get("channel_id"):
-                if self.cfg.disable_create:
-                    sessions[sid]["last_status"] = status
-                    return
-                want_name = channel_name(self.cfg.prefix, project, title)
-                try:
-                    cid, cname = self._create_channel(want_name, project, title, sid)
-                except ApiError as e:
-                    log(f"recreate channel for {sid[:12]}: {e}; will retry next event")
-                    sessions[sid]["last_status"] = status
-                    return
-                log(f"outbound: recreated channel for {sid[:12]} -> #{cname}")
-                sessions[sid]["channel_id"] = cid
-                sessions[sid]["channel_name"] = cname
-                sessions[sid]["closed"] = False
-                sessions[sid]["mentioned"] = False
-                self._announce_channel(cid, sid, project, title)
-                rec = self.store.get(sessions, sid)
+        if rec.closed and rec.channel_id:
+            # Permission loss and transient failures do not prove deletion.
+            # Retain the mapping and retry by ID; never mint a replacement.
+            if not self.slack.unarchive(rec.channel_id):
+                return
+            sessions[sid].update(closed=False, archived_ok=False, mentioned=False)
+            rec = self.store.get(sessions, sid)
 
         # The channel name tracks the current project + title, so a title
         # change renames the channel live (Slack supports conversations.rename).
@@ -862,11 +867,8 @@ class Bridge:
                 sessions[sid].pop("name_taken", None)
                 rec = self.store.get(sessions, sid)
             elif result == "gone":
-                # Channel no longer exists — reset so a fresh one is created below.
-                sessions[sid]["channel_id"] = ""
-                sessions[sid]["closed"] = True
-                log(f"outbound: channel gone for {sid[:12]}; will recreate")
-                rec = self.store.get(sessions, sid)
+                log(f"outbound: channel inaccessible for {sid[:12]}; retaining mapping")
+                return
             elif result == "taken":
                 # Name held by another channel: keep the current channel and
                 # name; record it so we stop retrying until the title changes.
@@ -897,6 +899,10 @@ class Bridge:
             sessions[sid]["channel_name"] = cname
             sessions[sid]["closed"] = False
             sessions[sid]["mentioned"] = False
+            # Checkpoint ownership before any further network operation.
+            ownership = {key: sessions[sid][key] for key in
+                         ("channel_id", "channel_name", "closed", "mentioned")}
+            self.store.update(lambda records: records.setdefault(sid, {}).update(ownership))
             # Everything below is best-effort — wrap each step so an error
             # never aborts the state save (which would orphan the channel).
             try:
@@ -924,7 +930,10 @@ class Bridge:
             except ApiError as e:
                 log(f"seed last_mirror_id {sid} (non-fatal): {e}")
 
-        cid = sessions[sid]["channel_id"]
+        rec = self.store.get(sessions, sid)
+        cid = rec.channel_id
+        if not cid:
+            return
 
         # Alert on blocked/failed (mention once per channel).
         if is_alert:
@@ -950,27 +959,32 @@ class Bridge:
         # ensures only NEW items are ever posted.
         mirror_due = (is_turn_end or status == "running") and rec.channel_id and not rec.closed
         last_check = sessions[sid].get("last_mirror_check") or 0.0
-        if mirror_due and (is_turn_end or time.monotonic() - last_check > 10):
-            sessions[sid]["last_mirror_check"] = time.monotonic()
+        if mirror_due and (is_turn_end or time.time() - last_check > 10 or last_check > time.time()):
+            sessions[sid]["last_mirror_check"] = time.time()
             new_text, new_last_id = self._new_assistant_text(sid, rec.last_mirror_id)
+            delivered = True
             if new_text.strip():
                 try:
                     mts = self.slack.post_message(cid, new_text)
+                    delivered = bool(mts)
                     if _ts_greater(mts, rec.last_seen_ts):
                         sessions[sid]["last_seen_ts"] = mts
                 except ApiError as e:
+                    delivered = False
                     log(f"mirror post {cid} (non-fatal): {e.err}")
-                # Ops session: also deliver the reply into the user's DM so
-                # the DM conversation is two-way.
-                dm_cid = sessions[sid].get("dm_channel") or ""
-                if sid == self.cfg.ops_session and dm_cid:
-                    try:
-                        self.slack.post_message(dm_cid, new_text)
-                        log(f"dm: replied to DM {dm_cid} for ops session")
-                    except ApiError as e:
-                        log(f"dm reply {dm_cid} (non-fatal): {e.err}")
-            if new_last_id and new_last_id != rec.last_mirror_id:
+            if delivered and new_last_id and new_last_id != rec.last_mirror_id:
                 sessions[sid]["last_mirror_id"] = new_last_id
+            # DM delivery has its own cursor: a failed DM must not lose
+            # replies, and retrying Slack must not duplicate a successful DM.
+            dm_cid = sessions[sid].get("dm_channel") or ""
+            if sid == self.cfg.ops_session and dm_cid:
+                dm_cursor = sessions[sid].setdefault("last_dm_mirror_id", rec.last_mirror_id)
+                dm_text, dm_last = self._new_assistant_text(sid, dm_cursor)
+                try:
+                    if not dm_text.strip() or self.slack.post_message(dm_cid, dm_text):
+                        sessions[sid]["last_dm_mirror_id"] = dm_last
+                except ApiError as e:
+                    log(f"dm reply {dm_cid} (non-fatal): {e.err}")
         sessions[sid]["last_status"] = status
 
     def _create_channel(self, name: str, project: str, title: str, sid: str) -> tuple[str, str]:
@@ -980,17 +994,8 @@ class Bridge:
             return self.slack.create_channel(name, self.cfg.private), name
         except ApiError as e:
             if e.err == "name_taken":
-                # Try to find and unarchive the existing channel (may be an
-                # old channel for this same session that got archived).
-                try:
-                    cid = self.slack.lookup_by_name(name, self.cfg.private)
-                    if cid:
-                        self.slack.unarchive(cid)
-                        return cid, name
-                except ApiError:
-                    pass  # lookup failed (rate limit, etc.) — fall through
-                # Name taken: try the shortid-suffixed name, then numeric
-                # suffixes — covers channels orphaned by previous runs.
+                # Names can belong to unrelated sessions. Only a persisted
+                # channel ID proves ownership; use the session-specific suffix.
                 fb = conflict_name(self.cfg.prefix, project, title, sid)
                 for candidate in [fb] + [f"{fb}-{n}" for n in range(2, 6)]:
                     try:
@@ -1274,7 +1279,7 @@ class Bridge:
                                 try:
                                     return not self.omni.get_session(sid)
                                 except ApiError as e:
-                                    return "404" in str(e) or "not_found" in str(e)
+                                    return e.source == "omnigent" and e.err == "http 404"
                                 except Exception:
                                     return False  # unknown — do nothing this cycle
                             if await asyncio.to_thread(_really_gone):

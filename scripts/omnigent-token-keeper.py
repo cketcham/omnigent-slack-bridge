@@ -5,9 +5,9 @@ A tiny daemon that re-logins to the Omnigent server before the session JWT
 expires, so the token in ``~/.omnigent/auth_tokens.json`` is always valid for
 the CLI, the Slack bridge, and anything else that reads it.
 
-Reads the server URL from ``~/.omnigent/config.yaml`` and the username +
-password from ``~/.omnigent/login-credentials``. Re-logins when <1h of token
-lifetime remains. Checks every 5 minutes.
+Reads the server URL from ``~/.omnigent/config.yaml``. Uses the cached SSO
+refresh token first, then optional username/password credentials. Checks
+every five minutes, waiting for configuration when not yet logged in.
 
 Pure stdlib (urllib + json), so there's nothing to pip install.
 
@@ -20,6 +20,9 @@ Usage:
 from __future__ import annotations
 
 import json
+import functools
+import fcntl
+import tempfile
 import os
 import re
 import sys
@@ -32,6 +35,22 @@ from pathlib import Path
 CHECK_INTERVAL = 300  # 5 minutes
 REFRESH_THRESHOLD = 3600  # refresh when <1h of lifetime remains
 DEFAULT_EXPIRES_IN = 8 * 3600  # 8 hours (server default)
+
+
+def _serialized_refresh(fn):
+    """Coordinate refresh-token rotation across cron, bridge, and keeper.
+
+    The CLI may also write this cache; this advisory lock coordinates these
+    three daemons, not external clients that do not use the lock.
+    """
+    @functools.wraps(fn)
+    def wrapped(*args, **kwargs):
+        path = Path.home() / ".omnigent" / "auth_tokens.lock"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            return fn(*args, **kwargs)
+    return wrapped
 
 
 def _config_path() -> Path:
@@ -97,13 +116,16 @@ def _store_token(server_url: str, token: str, refresh_token: str, expires_in: in
         entry["refresh_token"] = refresh_token
     entry["expires_at"] = time.time() + expires_in
     data[server_url] = entry
+    # Unique temporary files start private even if an old .tmp exists.
     path.parent.mkdir(parents=True, exist_ok=True)
-    # 0600 regardless of umask — this file holds access+refresh tokens.
-    tmp = str(path) + ".tmp"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
-        json.dump(data, f, indent=2)
-    os.replace(tmp, str(path))
+    fd, tmp = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, path)
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+
 
 
 def _login(server_url: str, username: str, password: str) -> dict | None:
@@ -169,6 +191,7 @@ def _refresh_via_grant(server_url: str, entry: dict) -> bool:
     return True
 
 
+@_serialized_refresh
 def refresh_if_needed(server_url: str) -> bool:
     """Refresh when the token expires within REFRESH_THRESHOLD **or** when a
     liveness probe shows the server rejects it (a redeploy invalidates issued
@@ -245,18 +268,14 @@ def run_once() -> int:
 
 
 def run_loop() -> int:
-    server = _read_server_url()
-    if not server:
-        log("no server URL in ~/.omnigent/config.yaml")
-        return 1
-    creds = _read_credentials()
-    if not creds:
-        log("no ~/.omnigent/login-credentials — cannot auto-refresh")
-        return 1
-    log(f"omnigent-token-keeper started; server={server} check={CHECK_INTERVAL}s threshold={REFRESH_THRESHOLD}s")
+    log(f"omnigent-token-keeper started; check={CHECK_INTERVAL}s threshold={REFRESH_THRESHOLD}s")
     while True:
         try:
-            refresh_if_needed(server)
+            # Re-read configuration so a fresh login or server switch is
+            # picked up without restarting the daemon.
+            server = _read_server_url()
+            if server:
+                refresh_if_needed(server)
         except Exception as e:
             log(f"error: {e}")
         time.sleep(CHECK_INTERVAL)
@@ -281,7 +300,7 @@ def run_status() -> int:
     print(f"remaining:     {remaining/3600:.1f}h" if remaining > 0 else "expired")
     print(f"refresh_token: {'yes' if has_refresh else 'no'}")
     print(f"credentials:   {'yes' if has_creds else 'no'}")
-    print(f"will refresh:   {'yes' if remaining < REFRESH_THRESHOLD and has_creds else 'no'}")
+    print(f"will refresh:   {'yes' if remaining <= REFRESH_THRESHOLD and (has_creds or has_refresh) else 'no'}")
     return 0
 
 
@@ -292,8 +311,8 @@ Usage:
   omnigent-token-keeper once     Refresh once if needed, then exit.
   omnigent-token-keeper status   Print token expiry and refresh status.
 
-Reads ~/.omnigent/config.yaml (server URL) and ~/.omnigent/login-credentials
-(username + password). Re-logins when <1h of token lifetime remains.
+Reads ~/.omnigent/config.yaml and auth_tokens.json. Uses SSO refresh tokens
+or optional login-credentials. Refreshes when <1h of token lifetime remains.
 """
 
 

@@ -97,8 +97,12 @@ def _store_token(server_url: str, token: str, refresh_token: str, expires_in: in
         entry["refresh_token"] = refresh_token
     entry["expires_at"] = time.time() + expires_in
     data[server_url] = entry
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # 0600 regardless of umask — this file holds access+refresh tokens.
     tmp = str(path) + ".tmp"
-    Path(tmp).write_text(json.dumps(data, indent=2))
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f, indent=2)
     os.replace(tmp, str(path))
 
 
